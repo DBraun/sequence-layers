@@ -16,8 +16,10 @@
 import fractions
 import functools
 import math
+from typing import Callable
 
 from flax import nnx
+import jax
 import jax.numpy as jnp
 import numpy as np
 from sequence_layers.jax import utils
@@ -651,6 +653,301 @@ class Bidirectional(types.Emitting):
         self.combination, y_forward, y_backward
     )
     return y, (fwd_emits, bwd_emits)
+
+
+class Repeat(types.Emitting):
+  """A combinator that repeats a SequenceLayer N times using nnx.scan.
+
+  Parameters are stacked with a leading ``num_repeats`` dimension (created
+  via ``nnx.vmap`` at construction time). Execution uses ``nnx.scan`` so
+  the layer logic is compiled only once.
+
+  Requires that the child layer has ``output_ratio == 1`` and that the
+  output dtype and shape equal the input dtype and shape, since the
+  input and output to ``jax.lax.scan`` must match.
+  """
+
+  def __init__(
+      self,
+      layer_fn: Callable[[nnx.Rngs], types.SequenceLayer],
+      *,
+      num_repeats: int,
+      rngs: nnx.Rngs,
+  ):
+    super().__init__()
+    if num_repeats <= 0:
+      raise ValueError(
+          f'Expected num_repeats > 0, got {num_repeats}.'
+      )
+    self.num_repeats = num_repeats
+
+    # Create num_repeats copies with stacked params via vmap.
+    @nnx.split_rngs(splits=num_repeats)
+    @nnx.vmap(in_axes=(0,), out_axes=0)
+    def create_layers(rngs: nnx.Rngs):
+      return layer_fn(rngs)
+
+    self.child_layer = create_layers(rngs)
+
+    # Validate constraints.
+    child_output_ratio = self._get_child_property(
+        lambda l: l.output_ratio
+    )
+    if child_output_ratio != 1:
+      raise ValueError(
+          'Repeat child layer must have output_ratio == 1, got'
+          f' {child_output_ratio}.'
+      )
+
+  def _get_child_property(self, property_fn):
+    """Read a property from the child layer.
+
+    Since the child layer was created with vmap, its parameters have a
+    leading num_repeats dimension. For scalar properties (block_size,
+    output_ratio, etc.) the value is the same for every repeat, so we
+    just need to read it once. We use nnx.scan to enter the proper
+    scope so the child layer sees correctly-shaped parameters.
+    """
+    results = []
+
+    @nnx.scan(in_axes=(0,), out_axes=0, length=self.num_repeats)
+    def read_property(layer):
+      results.append(property_fn(layer))
+      return layer  # dummy output, required by scan
+
+    read_property(self.child_layer)
+    return results[0]
+
+  @property
+  def supports_step(self) -> bool:
+    return self._get_child_property(lambda l: l.supports_step)
+
+  @property
+  def input_latency(self) -> int:
+    return self.get_accumulated_input_latency(0)
+
+  @property
+  def output_latency(self) -> int:
+    return self.get_accumulated_output_latency(0)
+
+  def get_accumulated_input_latency(self, input_latency: int) -> int:
+    child_fn = lambda l: l.get_accumulated_input_latency(input_latency)
+    child_latency = self._get_child_property(child_fn)
+    # Each repeat accumulates on top of the previous.
+    result = input_latency
+    for _ in range(self.num_repeats):
+      result = child_fn(
+          # Use a dummy to get the per-layer contribution.
+          type('_', (), {
+              'get_accumulated_input_latency': lambda self, il: child_latency
+          })()
+      ) if False else result  # noqa
+    # Actually: each child has the same latency contribution.
+    # input_latency_per_child = child_latency - input_latency
+    # total = input_latency + num_repeats * per_child
+    per_child = child_latency - input_latency
+    return input_latency + self.num_repeats * per_child
+
+  def get_accumulated_output_latency(self, output_latency: int) -> int:
+    child_fn = lambda l: l.get_accumulated_output_latency(output_latency)
+    child_latency = self._get_child_property(child_fn)
+    per_child = child_latency - output_latency
+    return output_latency + self.num_repeats * per_child
+
+  @property
+  def block_size(self) -> int:
+    child_block_size = self._get_child_property(
+        lambda l: l.block_size
+    )
+    child_output_ratio = self._get_child_property(
+        lambda l: l.output_ratio
+    )
+    block_size = fractions.Fraction(1)
+    output_ratio = fractions.Fraction(1)
+    for _ in range(self.num_repeats):
+      block_size = (
+          np.lcm(block_size * output_ratio, child_block_size)
+          / output_ratio
+      )
+      output_ratio *= child_output_ratio
+    assert block_size.denominator == 1
+    return block_size.numerator
+
+  @property
+  def output_ratio(self) -> fractions.Fraction:
+    child_output_ratio = self._get_child_property(
+        lambda l: l.output_ratio
+    )
+    return child_output_ratio ** self.num_repeats
+
+  @functools.cached_property
+  def receptive_field_per_step(
+      self,
+  ) -> dict[int, types.ReceptiveField]:
+    child_rf = self._get_child_property(
+        lambda l: l.receptive_field_per_step
+    )
+    child_output_ratio = self._get_child_property(
+        lambda l: l.output_ratio
+    )
+    overall_rf = child_rf
+    for _ in range(self.num_repeats - 1):
+      overall_rf = utils.propagate_receptive_field_to_prev_layer(
+          overall_rf, child_rf, child_output_ratio
+      )
+    return overall_rf
+
+  def get_output_dtype(
+      self,
+      input_dtype: types.DType,
+      *,
+      constants: types.Constants | None = None,
+  ) -> types.DType:
+    return input_dtype
+
+  def get_output_shape(
+      self,
+      input_shape: types.ShapeLike,
+      *,
+      constants: types.Constants | None = None,
+  ) -> types.Shape:
+    return tuple(input_shape)
+
+  def get_initial_state(
+      self,
+      batch_size: int,
+      input_spec: types.ShapeDType,
+      *,
+      constants: types.Constants | None = None,
+  ) -> types.State:
+    @nnx.scan(in_axes=(0,), out_axes=0)
+    def get_states(layer):
+      return layer.get_initial_state(
+          batch_size, input_spec, constants=constants
+      )
+
+    return get_states(self.child_layer)
+
+  def _layer_internal(
+      self,
+      x: types.Sequence,
+      constants: types.Constants | None,
+      with_emits: bool,
+  ) -> tuple[types.Sequence, types.Emits]:
+    @nnx.scan(
+        in_axes=(nnx.Carry, 0),
+        out_axes=(nnx.Carry, 0) if with_emits else nnx.Carry,
+    )
+    def scan_fn(x_tuple, layer):
+      seq = types.Sequence(x_tuple[0], x_tuple[1])
+      if with_emits:
+        y, emits = layer.layer_with_emits(seq, constants=constants)
+      else:
+        y = layer.layer(seq, constants=constants)
+        emits = ()
+      carry_out = (y.unmask().values, y.mask)
+      if with_emits:
+        return carry_out, emits
+      return carry_out
+
+    if with_emits:
+      result_tuple, emits = scan_fn(
+          (x.unmask().values, x.mask), self.child_layer
+      )
+      emits = utils.unstack_tree(emits)
+    else:
+      result_tuple = scan_fn(
+          (x.unmask().values, x.mask), self.child_layer
+      )
+      emits = ()
+
+    y = types.Sequence(result_tuple[0], result_tuple[1])
+    return y, emits
+
+  def layer_with_emits(
+      self,
+      x: types.Sequence,
+      *,
+      constants: types.Constants | None = None,
+  ) -> tuple[types.Sequence, types.Emits]:
+    return self._layer_internal(x, constants, with_emits=True)
+
+  @types.check_layer
+  def layer(
+      self,
+      x: types.Sequence,
+      *,
+      constants: types.Constants | None = None,
+  ) -> types.Sequence:
+    y, _ = self._layer_internal(x, constants, with_emits=False)
+    return y
+
+  def _step_internal(
+      self,
+      x: types.Sequence,
+      state: types.State,
+      constants: types.Constants | None,
+      with_emits: bool,
+  ) -> tuple[types.Sequence, types.State, types.Emits]:
+    @nnx.scan(
+        in_axes=(nnx.Carry, 0, 0),
+        out_axes=(
+            (nnx.Carry, 0, 0) if with_emits else (nnx.Carry, 0)
+        ),
+    )
+    def scan_fn(x_tuple, layer, state):
+      seq = types.Sequence(x_tuple[0], x_tuple[1])
+      if with_emits:
+        y, new_state, emits = layer.step_with_emits(
+            seq, state, constants=constants
+        )
+      else:
+        y, new_state = layer.step(
+            seq, state, constants=constants
+        )
+        emits = ()
+      carry_out = (y.unmask().values, y.mask)
+      if with_emits:
+        return carry_out, new_state, emits
+      return carry_out, new_state
+
+    if with_emits:
+      result_tuple, new_state, emits = scan_fn(
+          (x.unmask().values, x.mask), self.child_layer, state
+      )
+      emits = utils.unstack_tree(emits)
+    else:
+      result_tuple, new_state = scan_fn(
+          (x.unmask().values, x.mask), self.child_layer, state
+      )
+      emits = ()
+
+    y = types.Sequence(result_tuple[0], result_tuple[1])
+    return y, new_state, emits
+
+  @types.check_step
+  def step(
+      self,
+      x: types.Sequence,
+      state: types.State,
+      *,
+      constants: types.Constants | None = None,
+  ) -> tuple[types.Sequence, types.State]:
+    y, state, _ = self._step_internal(
+        x, state, constants, with_emits=False
+    )
+    return y, state
+
+  def step_with_emits(
+      self,
+      x: types.Sequence,
+      state: types.State,
+      *,
+      constants: types.Constants | None = None,
+  ) -> tuple[types.Sequence, types.State, types.Emits]:
+    return self._step_internal(
+        x, state, constants, with_emits=True
+    )
 
 
 class Blockwise(types.SequenceLayer):

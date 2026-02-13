@@ -142,5 +142,6 @@ from sequence_layers.nnx.combinators import Bidirectional
 from sequence_layers.nnx.combinators import Blockwise
 from sequence_layers.nnx.combinators import CombinationMode
 from sequence_layers.nnx.combinators import Parallel
+from sequence_layers.nnx.combinators import Repeat
 from sequence_layers.nnx.combinators import Residual
 from sequence_layers.nnx.combinators import Serial

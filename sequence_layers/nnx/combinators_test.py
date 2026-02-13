@@ -14,12 +14,15 @@
 """Tests for NNX combinators."""
 
 from flax import nnx
+import jax
 import jax.numpy as jnp
 from sequence_layers.jax.test_utils import random_sequence
 from sequence_layers.nnx import combinators
+from sequence_layers.nnx import convolution
 from sequence_layers.nnx import dense
 from sequence_layers.nnx import simple
 from sequence_layers.nnx import test_utils
+from sequence_layers.nnx import types
 
 
 class SerialTest(test_utils.SequenceLayerTest):
@@ -275,6 +278,128 @@ class BlockwiseTest(test_utils.SequenceLayerTest):
     l = combinators.Blockwise(child_layer=child, block_size=4)
     self.assertEqual(l.get_output_shape((5,)), (3,))
     self.assertEqual(l.block_size, 4)
+
+
+class RepeatTest(test_utils.SequenceLayerTest):
+
+  def test_repeat_dense(self):
+    l = combinators.Repeat(
+        lambda rngs: dense.Dense(
+            in_features=5, features=5, rngs=rngs,
+        ),
+        num_repeats=2,
+        rngs=nnx.Rngs(0),
+    )
+    x = random_sequence(2, 3, 5)
+    self.assertEqual(l.block_size, 1)
+    self.assertEqual(l.output_ratio, 1)
+    self.assertTrue(l.supports_step)
+    self.assertEqual(l.input_latency, 0)
+    self.assertEqual(l.output_latency, 0)
+    self.verify_contract(l, x)
+
+  def test_repeat_dense_params_stacked(self):
+    l = combinators.Repeat(
+        lambda rngs: dense.Dense(
+            in_features=5, features=5, rngs=rngs,
+        ),
+        num_repeats=3,
+        rngs=nnx.Rngs(0),
+    )
+    # Params should have leading num_repeats dimension.
+    self.assertEqual(l.child_layer.kernel.shape, (3, 5, 5))
+    self.assertEqual(l.child_layer.bias.shape, (3, 5))
+    # Each repeat should have different params.
+    self.assertFalse(jnp.allclose(
+        l.child_layer.kernel[0], l.child_layer.kernel[1]
+    ))
+
+  def test_repeat_conv1d(self):
+    l = combinators.Repeat(
+        lambda rngs: convolution.Conv1D(
+            in_features=5, filters=5, kernel_size=3,
+            padding='reverse_causal_valid', rngs=rngs,
+        ),
+        num_repeats=2,
+        rngs=nnx.Rngs(0),
+    )
+    x = random_sequence(2, 6, 5)
+    self.assertEqual(l.block_size, 1)
+    self.assertEqual(l.output_ratio, 1)
+    self.assertTrue(l.supports_step)
+    self.assertEqual(l.input_latency, 4)
+    self.assertEqual(l.output_latency, 4)
+    self.verify_contract(l, x)
+
+  def test_repeat_matches_serial(self):
+    """Verify Repeat produces the same result as manually unrolled Serial."""
+    l = combinators.Repeat(
+        lambda rngs: dense.Dense(
+            in_features=5, features=5, rngs=rngs,
+        ),
+        num_repeats=3,
+        rngs=nnx.Rngs(0),
+    )
+    l.eval()
+    x = random_sequence(2, 4, 5)
+    y = l.layer(x)
+
+    # Manually run each repeat by slicing params.
+    y_manual = x
+    for i in range(3):
+      kernel_i = l.child_layer.kernel[i]
+      bias_i = l.child_layer.bias[i]
+      vals = jnp.einsum(
+          'btf,fg->btg', y_manual.values, kernel_i
+      ) + bias_i
+      y_manual = types.Sequence(vals, y_manual.mask)
+    self.assertSequencesClose(y, y_manual)
+
+  def test_repeat_output_shape(self):
+    l = combinators.Repeat(
+        lambda rngs: dense.Dense(
+            in_features=5, features=5, rngs=rngs,
+        ),
+        num_repeats=4,
+        rngs=nnx.Rngs(0),
+    )
+    self.assertEqual(l.get_output_shape((5,)), (5,))
+
+  def test_repeat_invalid_output_ratio_raises(self):
+    import fractions
+
+    class FakeDoubleRatio(simple.Identity):
+      @property
+      def output_ratio(self):
+        return fractions.Fraction(2)
+
+    with self.assertRaises(ValueError):
+      combinators.Repeat(
+          lambda rngs: FakeDoubleRatio(),
+          num_repeats=2,
+          rngs=nnx.Rngs(0),
+      )
+
+  def test_repeat_zero_repeats_raises(self):
+    with self.assertRaises(ValueError):
+      combinators.Repeat(
+          lambda rngs: simple.Identity(),
+          num_repeats=0,
+          rngs=nnx.Rngs(0),
+      )
+
+  def test_repeat_train_eval(self):
+    l = combinators.Repeat(
+        lambda rngs: dense.Dense(
+            in_features=5, features=5, rngs=rngs,
+        ),
+        num_repeats=2,
+        rngs=nnx.Rngs(0),
+    )
+    l.train()
+    self.assertFalse(l.deterministic)
+    l.eval()
+    self.assertTrue(l.deterministic)
 
 
 if __name__ == '__main__':

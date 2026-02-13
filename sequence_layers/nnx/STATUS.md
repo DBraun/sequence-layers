@@ -2,7 +2,7 @@
 
 Proof-of-concept port of `sequence_layers` from Flax Linen to Flax NNX.
 
-**262 tests passing** across all ported modules.
+**270 tests passing** across all ported modules.
 
 ## Ported
 
@@ -79,6 +79,7 @@ All base classes ported: `SequenceLayer`, `Steppable`, `Stateless`,
 | Residual | Done |
 | Parallel | Done |
 | Bidirectional | Done |
+| Repeat | Done |
 | Blockwise | Done |
 
 ---
@@ -116,7 +117,6 @@ equivalents.
 ### combinators.py
 | Layer | Reason |
 |-------|--------|
-| Repeat | Requires `nn.scan` for efficient repeated application |
 | SerialModules | Variant of Serial using `nn.share_scope`; NNX doesn't need this |
 | ParallelChannels | Splits channels across branches; medium complexity |
 | CheckpointGradient | Uses `nn.remat`; NNX has `nnx.remat` but API differs |
