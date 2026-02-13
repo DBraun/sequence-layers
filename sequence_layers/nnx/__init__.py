@@ -96,6 +96,7 @@ from sequence_layers.nnx.simple import Upsample2D
 # Dense layers.
 from sequence_layers.nnx.dense import Dense
 from sequence_layers.nnx.dense import DenseShaped
+from sequence_layers.nnx.dense import EinsumDense
 
 # Convolution layers.
 from sequence_layers.nnx.convolution import Conv1D

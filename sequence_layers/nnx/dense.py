@@ -13,6 +13,7 @@
 # limitations under the License.
 """Dense NNX layers."""
 
+import typing
 from typing import Callable
 
 from flax import nnx
@@ -216,3 +217,190 @@ class DenseShaped(types.Stateless):
       return x.apply_values(dense_fn)
     else:
       return x.apply_values_masked(dense_fn)
+
+
+def _parse_einsum_equation(equation: str) -> tuple[str, str, str]:
+  """Parse and validate an EinsumDense equation."""
+  if '->' not in equation:
+    raise ValueError(
+        f'equation is not valid for EinsumDense: {equation}'
+    )
+  left, output_spec = equation.split('->')
+  input_spec, kernel_spec = left.split(',')
+  if not input_spec.startswith('...') or not output_spec.startswith('...'):
+    raise ValueError('Equation must be of the form "...X,Y->...Z".')
+  if 3 + len(set(input_spec[3:])) != len(input_spec):
+    raise ValueError(
+        f'Equation {input_spec=} must not contain duplicate variables.'
+    )
+  if 3 + len(set(output_spec[3:])) != len(output_spec):
+    raise ValueError(
+        f'Equation {output_spec=} must not contain duplicate variables.'
+    )
+  return input_spec, kernel_spec, output_spec
+
+
+def _resolve_output_shape(
+    equation: str,
+    input_shape: types.ShapeLike,
+    output_shape: tuple[int | None, ...],
+) -> types.Shape:
+  """Resolve None entries in output_shape using input_shape."""
+  input_spec, _, output_spec = _parse_einsum_equation(equation)
+  input_spec_trimmed = input_spec[3:]
+  output_spec_trimmed = output_spec[3:]
+
+  if len(input_spec_trimmed) != len(input_shape):
+    raise ValueError(
+        f'Equation {input_spec_trimmed=} does not match'
+        f' {input_shape=} rank.'
+    )
+
+  input_dims = {
+      d: input_shape[i] for i, d in enumerate(input_spec_trimmed)
+  }
+
+  resolved = list(output_shape)
+  if len(output_spec_trimmed) != len(resolved):
+    raise ValueError(
+        f'Equation {output_spec_trimmed=} does not match'
+        f' {output_shape=}.'
+    )
+  for i, d in enumerate(output_spec_trimmed):
+    if resolved[i] is None:
+      resolved[i] = input_dims[d]
+    elif d in input_dims and resolved[i] != input_dims[d]:
+      raise ValueError(
+          'Input shape and output shape inconsistent for dimension'
+          f' {d=}. {output_shape=} {input_shape=}'
+      )
+  return typing.cast(types.Shape, tuple(resolved))
+
+
+class EinsumDense(types.Stateless):
+  """A dense layer that transforms channel shape with an einsum equation.
+
+  Equation input and output specs must have leading ellipses to
+  broadcast over the batch and time dimensions.
+
+  Example::
+
+    Input sequence: [b, t, c1, c2, c3]
+    equation = '...abc,bd->...bd'
+    output_shape = [None, c4]
+    bias_axes = 'd'
+    Output sequence: [b, t, c2, c4]
+
+    Kernel shape: [c2, c4]
+    Bias shape: [c4]
+  """
+
+  def __init__(
+      self,
+      *,
+      equation: str,
+      input_shape: types.ShapeLike,
+      output_shape: tuple[int | None, ...],
+      bias_axes: str = '',
+      activation: Callable[[jax.Array], jax.Array] | None = None,
+      compute_dtype: types.DType | None = None,
+      param_dtype: types.DType = jnp.float32,
+      precision=None,
+      kernel_init=nnx.initializers.lecun_normal(),
+      bias_init=nnx.initializers.zeros_init(),
+      rngs: nnx.Rngs,
+  ):
+    super().__init__()
+    self._equation = equation
+    self._input_shape = tuple(input_shape)
+    self._output_shape_spec = tuple(output_shape)
+    self._bias_axes = bias_axes
+    self.activation = activation
+    self.compute_dtype = compute_dtype
+    self._param_dtype = param_dtype
+    self.precision = precision
+
+    # Resolve output shape and compute kernel/bias shapes.
+    resolved_output = _resolve_output_shape(
+        equation, self._input_shape, self._output_shape_spec
+    )
+    self._resolved_output_shape = resolved_output
+
+    input_spec, kernel_spec, output_spec = _parse_einsum_equation(
+        equation
+    )
+    input_spec_trimmed = input_spec[3:]
+    output_spec_trimmed = output_spec[3:]
+
+    # Full shapes with batch+time prefix for the utility function.
+    full_input_shape = (0, 0) + tuple(self._input_shape)
+    kernel_shape, bias_shape, _ = utils.einsum_analyze_split_string(
+        (input_spec_trimmed, kernel_spec, output_spec_trimmed),
+        bias_axes,
+        full_input_shape,
+        list(resolved_output),
+        left_elided=True,
+    )
+
+    self.kernel = nnx.Param(
+        kernel_init(rngs.params(), tuple(kernel_shape), param_dtype)
+    )
+    self._has_bias = bias_shape is not None
+    if self._has_bias:
+      self.bias = nnx.Param(
+          bias_init(rngs.params(), tuple(bias_shape), param_dtype)
+      )
+
+  def get_output_dtype(
+      self,
+      input_dtype: types.DType,
+      *,
+      constants: types.Constants | None = None,
+  ) -> types.DType:
+    return utils.get_promoted_dtype(
+        input_dtype, self._param_dtype, dtype=self.compute_dtype
+    )
+
+  def get_output_shape(
+      self,
+      input_shape: types.ShapeLike,
+      *,
+      constants: types.Constants | None = None,
+  ) -> types.Shape:
+    return _resolve_output_shape(
+        self._equation, input_shape, self._output_shape_spec
+    )
+
+  @types.check_layer
+  def layer(
+      self,
+      x: types.Sequence,
+      *,
+      constants: types.Constants | None = None,
+  ) -> types.Sequence:
+    kernel = self.kernel[...]
+    compute_dtype = utils.get_promoted_dtype(
+        x.dtype, self._param_dtype, dtype=self.compute_dtype
+    )
+    kernel = kernel.astype(compute_dtype)
+
+    has_bias = self._has_bias
+    has_activation = self.activation is not None
+    if has_bias:
+      bias = self.bias[...].astype(compute_dtype)
+
+    def einsum_fn(v):
+      v = v.astype(compute_dtype)
+      y = jnp.einsum(
+          self._equation, v, kernel, precision=self.precision
+      )
+      if has_bias:
+        y = utils.bias_add(y, bias)
+      if has_activation:
+        y = self.activation(y)
+      return y
+
+    if has_bias or has_activation:
+      return x.apply_values(einsum_fn)
+    else:
+      return x.apply_values_masked(einsum_fn)

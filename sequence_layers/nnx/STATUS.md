@@ -2,7 +2,7 @@
 
 Proof-of-concept port of `sequence_layers` from Flax Linen to Flax NNX.
 
-**270 tests passing** across all ported modules.
+**280 tests passing** across all ported modules.
 
 ## Ported
 
@@ -32,6 +32,7 @@ All base classes ported: `SequenceLayer`, `Steppable`, `Stateless`,
 |--------|--------|
 | Dense | Done |
 | DenseShaped | Done |
+| EinsumDense | Done |
 
 ### convolution.py
 | Ported | Status |
@@ -105,7 +106,6 @@ equivalents.
 ### dense.py
 | Layer | Reason |
 |-------|--------|
-| EinsumDense | Uses Flax `FlaxEinsumDense` internally; needs custom einsum impl |
 
 ### normalization.py
 | Layer | Reason |
@@ -158,10 +158,7 @@ equivalents.
    Linen dependencies.
 2. **CheckpointGradient** — NNX has `nnx.remat`; should be a thin wrapper.
 3. **ParallelChannels** — medium complexity, useful combinator.
-4. **EinsumDense** — replace `FlaxEinsumDense` with manual `jnp.einsum` +
-   bias (same pattern used for RGLRU gates).
-5. **Repeat** — blocked on `nn.scan` equivalent. NNX has `nnx.Scan` but
-   the API is different; needs investigation.
-6. **Advanced attention variants** — require porting
+4. **Advanced attention variants** — require porting
    `AttentionInputProjectionHelper` and attention common utilities first.
+   `EinsumDense` is now available to support this.
    This is a large effort that unlocks all 7+ attention variants.
