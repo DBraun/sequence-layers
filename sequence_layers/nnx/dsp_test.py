@@ -13,12 +13,17 @@
 # limitations under the License.
 """Tests for NNX DSP layers."""
 
+import fractions
+
 from absl.testing import parameterized
 import jax.numpy as jnp
+import numpy as np
 from sequence_layers.jax import signal
 from sequence_layers.jax.test_utils import random_sequence
+from sequence_layers.jax import types as jax_types
 from sequence_layers.nnx import dsp
 from sequence_layers.nnx import test_utils
+from sequence_layers.nnx import types
 
 
 class DelayTest(test_utils.SequenceLayerTest):
@@ -121,6 +126,196 @@ class WindowTest(test_utils.SequenceLayerTest):
         y,
         x.apply_values(lambda v: v * window[jnp.newaxis, jnp.newaxis, :]),
     )
+
+
+class FrameTest(test_utils.SequenceLayerTest):
+
+  @parameterized.product(
+      frame_length_frame_step=(
+          (1, 1), (2, 1), (1, 2), (2, 2), (3, 2), (2, 3),
+      ),
+      channel_shape=((), (4,), (5, 9)),
+      padding=(
+          'causal_valid',
+          'semicausal',
+          'reverse_causal_valid',
+          'causal',
+          'reverse_causal',
+          'same',
+          'valid',
+          'explicit_semicausal',
+          'semicausal_full',
+      ),
+  )
+  def test_frame(self, frame_length_frame_step, channel_shape, padding):
+    batch_size = 2
+    frame_length, frame_step = frame_length_frame_step
+    if padding == 'explicit_semicausal':
+      total_pad = frame_length - 1
+      overlap = max(0, frame_length - frame_step)
+      explicit_padding = (overlap, total_pad - overlap)
+    else:
+      explicit_padding = padding
+
+    l = dsp.Frame(
+        frame_length=frame_length,
+        frame_step=frame_step,
+        padding=explicit_padding,
+    )
+    self.assertEqual(
+        l.supports_step,
+        padding
+        in (
+            'causal_valid',
+            'semicausal',
+            'reverse_causal_valid',
+            'causal',
+            'reverse_causal',
+            'explicit_semicausal',
+        ),
+    )
+    self.assertEqual(l.block_size, frame_step)
+    self.assertEqual(1 / l.output_ratio, frame_step)
+
+    match padding:
+      case 'causal_valid' | 'causal' | 'semicausal':
+        expected_input_latency = 0
+      case 'reverse_causal_valid' | 'reverse_causal':
+        expected_input_latency = frame_length - 1
+      case 'explicit_semicausal':
+        expected_input_latency = (
+            (frame_length - 1)
+            - max(0, frame_length - frame_step)
+        )
+      case 'semicausal_full':
+        expected_input_latency = frame_step - 1
+      case _:
+        expected_input_latency = 0
+
+    self.assertEqual(l.input_latency, expected_input_latency)
+    self.assertEqual(
+        l.output_latency,
+        expected_input_latency // frame_step,
+    )
+
+    x = random_sequence(batch_size, 1, *channel_shape)
+    self.assertEqual(
+        l.get_output_shape(channel_shape or ()),
+        (frame_length,) + channel_shape,
+    )
+
+    for time in range(
+        20 * l.block_size - 1, 20 * l.block_size + 2
+    ):
+      x = random_sequence(
+          batch_size, time, *channel_shape,
+          low_length=time // 2,
+      )
+      self.verify_contract(l, x)
+
+  def test_frame_invalid_length(self):
+    with self.assertRaises(ValueError):
+      dsp.Frame(frame_length=0, frame_step=1)
+
+  def test_frame_invalid_step(self):
+    with self.assertRaises(ValueError):
+      dsp.Frame(frame_length=1, frame_step=0)
+
+
+class OverlapAddTest(test_utils.SequenceLayerTest):
+
+  @parameterized.product(
+      frame_length_frame_step=(
+          (1, 1), (2, 1), (2, 2), (3, 2),
+      ),
+      inner_shape=((), (3,), (5, 9)),
+      padding=('causal', 'valid', 'semicausal_full'),
+  )
+  def test_overlap_add(
+      self, frame_length_frame_step, inner_shape, padding
+  ):
+    frame_length, frame_step = frame_length_frame_step
+    b, t = 2, 34
+    x = random_sequence(
+        b, t, frame_length, *inner_shape
+    )
+    l = dsp.OverlapAdd(
+        frame_length=frame_length,
+        frame_step=frame_step,
+        padding=padding,
+    )
+    self.assertEqual(
+        l.supports_step, padding == 'causal'
+    )
+    self.assertEqual(l.block_size, 1)
+    self.assertEqual(l.output_ratio, frame_step)
+    self.assertEqual(
+        l.get_output_shape(
+            (frame_length,) + inner_shape
+        ),
+        inner_shape,
+    )
+    self.verify_contract(l, x)
+
+  @parameterized.parameters(
+      (1, 1), (2, 1), (2, 2), (3, 2)
+  )
+  def test_frame_overlap_add_perfect(
+      self, frame_length, frame_step
+  ):
+    b, t = 2, 35
+    x = random_sequence(b, t)
+    forward = dsp.Frame(
+        frame_length=frame_length,
+        frame_step=frame_step,
+        padding='semicausal_full',
+    )
+    backward = dsp.OverlapAdd(
+        frame_length=frame_length,
+        frame_step=frame_step,
+        padding='semicausal_full',
+    )
+    forward.eval()
+    backward.eval()
+
+    y = forward.layer(x)
+    z = backward.layer(y)
+
+    self.assertLessEqual(x.shape[1], z.shape[1])
+    self.assertTrue(jnp.all(z.lengths() >= x.lengths()))
+    np.testing.assert_array_equal(
+        z.mask[:, x.shape[1]:],
+        jnp.zeros(
+            (z.shape[0], z.shape[1] - x.shape[1]),
+            dtype=jnp.bool_,
+        ),
+    )
+
+    z_values = z.values[:, :x.shape[1]]
+    z_mask = z.mask[:, :x.shape[1]]
+    difference_mask = jnp.logical_xor(x.mask, z_mask)
+    self.assertTrue(
+        jnp.all(z_values[difference_mask] == 0)
+    )
+
+  def test_overlap_add_invalid_length(self):
+    with self.assertRaises(ValueError):
+      dsp.OverlapAdd(frame_length=0, frame_step=1)
+
+  def test_overlap_add_invalid_step(self):
+    with self.assertRaises(ValueError):
+      dsp.OverlapAdd(frame_length=1, frame_step=0)
+
+  def test_overlap_add_length_less_than_step(self):
+    with self.assertRaises(ValueError):
+      dsp.OverlapAdd(frame_length=2, frame_step=3)
+
+  def test_overlap_add_unsupported_padding(self):
+    with self.assertRaises(ValueError):
+      dsp.OverlapAdd(
+          frame_length=2, frame_step=1,
+          padding='reverse_causal',
+      )
 
 
 if __name__ == '__main__':

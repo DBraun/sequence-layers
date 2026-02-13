@@ -141,7 +141,9 @@ from sequence_layers.nnx.attention import SelfAttentionEmits
 
 # DSP layers.
 from sequence_layers.nnx.dsp import Delay
+from sequence_layers.nnx.dsp import Frame
 from sequence_layers.nnx.dsp import Lookahead
+from sequence_layers.nnx.dsp import OverlapAdd
 from sequence_layers.nnx.dsp import Window
 
 # Combinators.
