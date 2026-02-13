@@ -1,2 +1,5 @@
 dist
 env
+*.pyc
+.idea
+__pycache__/
