@@ -2,7 +2,7 @@
 
 Proof-of-concept port of `sequence_layers` from Flax Linen to Flax NNX.
 
-**520 tests passing** across all ported modules.
+**1100 tests passing** across all ported modules.
 
 ## Ported
 
@@ -92,6 +92,10 @@ All base classes ported: `SequenceLayer`, `Steppable`, `Stateless`,
 | Window | Done |
 | Frame | Done |
 | OverlapAdd | Done |
+| FFT, IFFT, RFFT, IRFFT | Done |
+| STFT | Done |
+| InverseSTFT | Done |
+| LinearToMelSpectrogram | Done |
 
 ---
 
@@ -145,11 +149,7 @@ equivalents.
 | TransformerXLRelativePositionEmbedding | Relative position embedding variant |
 
 ### dsp.py
-| Layer | Reason |
-|-------|--------|
-| FFT, IFFT, RFFT, IRFFT | FFT wrappers; depend on Frame/OverlapAdd (now ported) |
-| STFT, InverseSTFT | Depend on Frame, Window, FFT layers |
-| LinearToMelSpectrogram | Depends on STFT infrastructure |
+All layers ported.
 
 ### conditioning.py (entire module)
 | Layer | Reason |
@@ -160,15 +160,11 @@ equivalents.
 
 ## Suggested Next Steps (by priority)
 
-1. **FFT/IFFT/RFFT/IRFFT** — FFT wrappers; Frame/OverlapAdd now ported.
-   Unlocks STFT/InverseSTFT.
-2. **STFT, InverseSTFT** — Depend on Frame, Window, FFT layers (all
-   prerequisites now ported except FFT).
-3. **CheckpointGradient** — NNX has `nnx.remat`; should be a thin wrapper.
-4. **ParallelChannels** — medium complexity, useful combinator.
-5. **Relative position embeddings** (Shaw, T5, TransformerXL) — easy to
+1. **CheckpointGradient** — NNX has `nnx.remat`; should be a thin wrapper.
+2. **ParallelChannels** — medium complexity, useful combinator.
+3. **Relative position embeddings** (Shaw, T5, TransformerXL) — easy to
    moderate; prerequisite for LocalDotProductSelfAttention.
-6. **Advanced attention variants** — require porting
+4. **Advanced attention variants** — require porting
    `AttentionInputProjectionHelper` and attention common utilities first.
    `EinsumDense` and `GmmAttention` are now available.
    This is a large effort that unlocks all 6+ remaining attention variants.

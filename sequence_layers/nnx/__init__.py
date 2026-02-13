@@ -141,9 +141,16 @@ from sequence_layers.nnx.attention import SelfAttentionEmits
 
 # DSP layers.
 from sequence_layers.nnx.dsp import Delay
+from sequence_layers.nnx.dsp import FFT
 from sequence_layers.nnx.dsp import Frame
+from sequence_layers.nnx.dsp import IFFT
+from sequence_layers.nnx.dsp import InverseSTFT
+from sequence_layers.nnx.dsp import IRFFT
+from sequence_layers.nnx.dsp import LinearToMelSpectrogram
 from sequence_layers.nnx.dsp import Lookahead
 from sequence_layers.nnx.dsp import OverlapAdd
+from sequence_layers.nnx.dsp import RFFT
+from sequence_layers.nnx.dsp import STFT
 from sequence_layers.nnx.dsp import Window
 
 # Combinators.
