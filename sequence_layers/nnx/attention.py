@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from sequence_layers.jax import utils
+from sequence_layers.nnx import dense as dense_lib
 from sequence_layers.nnx import simple as simple_lib
 from sequence_layers.nnx import types
 
@@ -1095,3 +1096,387 @@ class DotProductAttention(types.Emitting):
     )
     context_vectors = types.Sequence(context_vectors, x.mask)
     return context_vectors, emits
+
+
+# ---------------------------------------------------------------------------
+# Helper: step-by-step with emits (used by GmmAttention monotonic mode)
+# ---------------------------------------------------------------------------
+
+
+def _step_by_step_with_emits(
+    l: types.Emitting,
+    x: types.Sequence,
+    initial_state: types.State,
+    *,
+    constants: types.Constants | None = None,
+) -> tuple[types.Sequence, types.State, types.Emits]:
+  """Executes a layer one timestep at a time, collecting emits.
+
+  Used by GmmAttention in monotonic mode to process multi-timestep inputs
+  sequentially (since each step depends on the previous position state).
+
+  Args:
+    l: The Emitting layer to invoke step-by-step.
+    x: The input Sequence to process.
+    initial_state: The initial state.
+    constants: Optional constants.
+
+  Returns:
+    Tuple of (output_sequence, final_state, stacked_emits).
+  """
+  state = initial_state
+  output_blocks = []
+  emits_list = []
+
+  for t in range(x.shape[1]):
+    x_t = x[:, t:t + 1]
+    y_t, state, emits_t = l.step_with_emits(
+        x_t, state, constants=constants
+    )
+    output_blocks.append(y_t)
+    emits_list.append(emits_t)
+
+  output = types.Sequence.concatenate_sequences(output_blocks)
+  # Stack emits along the time dimension.
+  emits = jax.tree.map(
+      lambda *args: types.Sequence.concatenate_sequences(list(args))
+      if isinstance(args[0], types.Sequence)
+      else jnp.concatenate(args, axis=1),
+      *emits_list,
+  )
+  return output, state, emits
+
+
+# ---------------------------------------------------------------------------
+# GmmAttention
+# ---------------------------------------------------------------------------
+
+
+class GmmAttention(types.PreservesType, types.Emitting):
+  """A multi-headed Gaussian-mixture attention layer.
+
+  Uses GMMs to model the probability distribution of where to focus
+  attention in the source sequence.
+  """
+
+  def __init__(
+      self,
+      *,
+      source_name: str,
+      num_heads: int,
+      units_per_head: int,
+      num_components: int,
+      monotonic: bool,
+      in_features: int,
+      precision: jax.lax.PrecisionLike = None,
+      hidden_kernel_init: nnx.initializers.Initializer = (
+          nnx.initializers.lecun_normal()
+      ),
+      output_kernel_init: nnx.initializers.Initializer = (
+          nnx.initializers.lecun_normal()
+      ),
+      output_use_bias: bool = True,
+      output_bias_init: nnx.initializers.Initializer = (
+          nnx.initializers.zeros_init()
+      ),
+      init_offset_bias: float = 0.0,
+      init_scale_bias: float = 0.0,
+      max_offset: float = -1.0,
+      rngs: nnx.Rngs,
+  ):
+    super().__init__()
+    if not source_name:
+      raise ValueError('source_name must be non-empty.')
+    if num_heads <= 0:
+      raise ValueError(
+          f'num_heads must be positive, got {num_heads}.'
+      )
+    if units_per_head <= 0:
+      raise ValueError(
+          f'units_per_head must be positive, got {units_per_head}.'
+      )
+    if num_components <= 0:
+      raise ValueError(
+          f'num_components must be positive, got {num_components}.'
+      )
+
+    self._source_name = source_name
+    self._num_heads = num_heads
+    self._units_per_head = units_per_head
+    self._num_components = num_components
+    self._monotonic = monotonic
+    self._precision = precision
+    self._init_offset_bias = init_offset_bias
+    self._init_scale_bias = init_scale_bias
+    self._max_offset = max_offset
+
+    # Hidden MLP: ...c,cnu -> ...nu
+    self._mlp_hidden = dense_lib.EinsumDense(
+        equation='...c,cnu->...nu',
+        input_shape=(in_features,),
+        output_shape=(num_heads, units_per_head),
+        precision=precision,
+        kernel_init=hidden_kernel_init,
+        activation=jax.nn.relu,
+        rngs=rngs,
+    )
+
+    # Output MLP: ...nu,nucl -> ...ncl
+    # Final axis holds 3 logits: prior, offset, scale.
+    self._mlp_output = dense_lib.EinsumDense(
+        equation='...nu,nucl->...ncl',
+        input_shape=(num_heads, units_per_head),
+        output_shape=(num_heads, num_components, 3),
+        precision=precision,
+        kernel_init=output_kernel_init,
+        bias_axes='ncl' if output_use_bias else '',
+        bias_init=output_bias_init,
+        rngs=rngs,
+    )
+
+  def _get_source(
+      self, constants: types.Constants | None
+  ) -> types.Sequence:
+    """Gets the source sequence from constants."""
+    if constants is None:
+      raise ValueError(
+          f'{type(self).__name__} requires constants with '
+          f'source_name={self._source_name!r}.'
+      )
+    source = constants.get(self._source_name)
+    if source is None:
+      raise ValueError(
+          f'{type(self).__name__} expected {self._source_name!r} '
+          f'in constants.'
+      )
+    if not isinstance(source, types.Sequence):
+      raise ValueError(
+          f'{type(self).__name__} expected a Sequence for '
+          f'{self._source_name!r}, got: {type(source)}.'
+      )
+    return source
+
+  @property
+  def supports_step(self) -> bool:
+    return True
+
+  @property
+  def receptive_field_per_step(
+      self,
+  ) -> dict[int, types.ReceptiveField]:
+    start = -np.inf if self._monotonic else 0
+    return {0: (start, 0)}
+
+  def get_output_shape(
+      self,
+      input_shape: types.ShapeLike,
+      *,
+      constants: types.Constants | None = None,
+  ) -> types.Shape:
+    if len(input_shape) != 1:
+      raise ValueError(
+          'GmmAttention requires rank 3 input, got:'
+          f' {(None, None) + tuple(input_shape)}'
+      )
+    source = self._get_source(constants)
+    return (self._num_heads, source.shape[2])
+
+  def get_initial_state(
+      self,
+      batch_size: int,
+      input_spec: types.ShapeDType,
+      *,
+      constants: types.Constants | None = None,
+  ) -> types.State:
+    if self._monotonic:
+      return jnp.zeros(
+          [batch_size, 1, self._num_heads, self._num_components],
+          input_spec.dtype,
+      )
+    else:
+      return ()
+
+  @types.check_layer_with_emits
+  def layer_with_emits(
+      self,
+      x: types.Sequence,
+      *,
+      constants: types.Constants | None = None,
+  ) -> tuple[types.Sequence, types.Emits]:
+    position = self.get_initial_state(
+        x.shape[0], x.channel_spec, constants=constants
+    )
+
+    if self._monotonic and x.shape[1] != 1:
+      context_vector, _, attention_weights = (
+          _step_by_step_with_emits(
+              self, x, position, constants=constants
+          )
+      )
+      return context_vector, attention_weights
+
+    source = self._get_source(constants)
+    context_vector, _, attention_weights = self.attention(
+        source=source, query=x, prev_position=position,
+    )
+    return context_vector, attention_weights
+
+  @types.check_step_with_emits
+  def step_with_emits(
+      self,
+      x: types.Sequence,
+      state: types.State,
+      *,
+      constants: types.Constants | None = None,
+  ) -> tuple[types.Sequence, types.State, types.Emits]:
+    source = self._get_source(constants)
+    if self._monotonic and x.shape[1] != 1:
+      return _step_by_step_with_emits(
+          self, x, state, constants=constants
+      )
+    context_vector, new_position, attention_weights = self.attention(
+        source=source, query=x, prev_position=state,
+    )
+    return context_vector, new_position, attention_weights
+
+  def attention(
+      self,
+      source: types.Sequence,
+      query: types.Sequence,
+      prev_position: types.State,
+  ) -> tuple[types.Sequence, types.State, types.Emits]:
+    """Computes GMM attention from query and previous position.
+
+    Args:
+      source: [batch, source_time, source_dim].
+      query: [batch, query_time, query_channels].
+      prev_position: [batch, 1, num_heads, num_components].
+
+    Returns:
+      context_vector: [batch, query_time, num_heads, source_dim].
+      position: [batch, 1, num_heads, num_components] or ().
+      attention_emits: CrossAttentionEmits.
+    """
+    if query.values.ndim != 3:
+      raise ValueError(
+          f'Expected [b, t, d] inputs, got: {query.values.shape}.'
+      )
+
+    query_time = query.values.shape[1]
+    if self._monotonic:
+      assert query_time == 1, (
+          f'Expected [b, 1, d] inputs, got: {query.values.shape}.'
+      )
+
+    # Project query through two-layer MLP.
+    query = self._mlp_hidden.layer(query)
+    query = self._mlp_output.layer(query)
+
+    # Each is [batch, query_time, num_heads, num_components].
+    prior_logits, offset_logits, scale_logits = utils.unstack(
+        query.values, axis=4
+    )
+
+    offset_logits = offset_logits + self._init_offset_bias
+    scale_logits = scale_logits + self._init_scale_bias
+
+    # Evaluate GMM PDFs.
+    attention_weights, new_position = self._eval_gmm_pdfs(
+        source, prior_logits, offset_logits, scale_logits,
+        prev_position,
+    )
+
+    # Mask invalid source positions.
+    attention_weights = jnp.where(
+        source.mask[:, jnp.newaxis, jnp.newaxis, :],
+        attention_weights,
+        jnp.zeros_like(attention_weights),
+    )
+
+    # Weighted sum over source:
+    # [b, query_time, num_heads, source_time] @
+    # [b, source_time, source_dim]
+    # -> [b, query_time, num_heads, source_dim]
+    context_vector = jnp.einsum(
+        'BiNj,BjS->BiNS',
+        attention_weights,
+        source.values,
+        precision=self._precision,
+    )
+
+    state = new_position if self._monotonic else ()
+    attention_emits = CrossAttentionEmits(
+        types.Sequence(attention_weights, query.mask)
+    )
+    return (
+        types.Sequence(context_vector, query.mask),
+        state,
+        attention_emits,
+    )
+
+  def _eval_gmm_pdfs(
+      self,
+      source: types.Sequence,
+      prior_logits: jax.Array,
+      offset_logits: jax.Array,
+      scale_logits: jax.Array,
+      prev_position: types.State,
+      normalize: bool = True,
+  ) -> tuple[jax.Array, jax.Array]:
+    """Evaluate the location GMMs on all encoder positions.
+
+    Args:
+      source: The source sequence.
+      prior_logits: [b, query_time, num_heads, num_components].
+      offset_logits: [b, query_time, num_heads, num_components].
+      scale_logits: [b, query_time, num_heads, num_components].
+      prev_position: [b, 1, num_heads, num_components].
+      normalize: Whether to normalize attention probabilities.
+
+    Returns:
+      attention_weights: [b, query_time, num_heads, source_time].
+      new_position: [b, query_time, num_heads, num_components].
+    """
+    priors = utils.run_in_at_least_fp32(jax.nn.softmax)(
+        prior_logits
+    )
+    variances = jnp.square(jax.nn.softplus(scale_logits))
+    if self._max_offset > 0:
+      position_offset = (
+          jax.nn.softplus(offset_logits)
+          - jax.nn.softplus(offset_logits - self._max_offset)
+      )
+    else:
+      position_offset = jax.nn.softplus(offset_logits)
+
+    if self._monotonic:
+      new_position = prev_position + position_offset
+    else:
+      new_position = position_offset
+
+    # Expand to [b, query_time, num_heads, 1, num_components].
+    priors = priors[:, :, :, jnp.newaxis, :]
+    means = new_position[:, :, :, jnp.newaxis, :]
+    variances = variances[:, :, :, jnp.newaxis, :]
+
+    # [1, 1, 1, source_time, 1]
+    source_length = source.values.shape[1]
+    encoder_positions = jnp.asarray(
+        jnp.arange(source_length), dtype=means.dtype
+    )
+    encoder_positions = encoder_positions[
+        jnp.newaxis, jnp.newaxis, jnp.newaxis, :, jnp.newaxis
+    ]
+
+    if normalize:
+      priors = priors * jnp.sqrt(
+          2 * np.pi * variances + 1e-8
+      )
+
+    probabilities = priors * jnp.exp(
+        -((encoder_positions - means) ** 2)
+        / (2 * variances + 1e-9)
+    )
+    # Sum over components.
+    probabilities = jnp.sum(probabilities, 4)
+    return probabilities, new_position

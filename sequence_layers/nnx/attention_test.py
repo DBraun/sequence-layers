@@ -280,5 +280,201 @@ class DotProductAttentionTest(test_utils.SequenceLayerTest):
     )
 
 
+class GmmAttentionTest(test_utils.SequenceLayerTest):
+
+  @parameterized.parameters(
+      (1, 2, True),
+      (1, 2, False),
+      (3, 5, True),
+      (3, 5, False),
+  )
+  def test_gmm_attention(self, num_heads, units_per_head, monotonic):
+    batch_size, source_time, source_channels = 2, 11, 5
+    channels = 3
+    num_components = 7
+    source_name = 'source'
+
+    l = attention.GmmAttention(
+        source_name=source_name,
+        num_heads=num_heads,
+        units_per_head=units_per_head,
+        num_components=num_components,
+        monotonic=monotonic,
+        in_features=channels,
+        init_offset_bias=1.0,
+        init_scale_bias=1.0,
+        rngs=nnx.Rngs(0),
+    )
+
+    self.assertEqual(l.block_size, 1)
+    self.assertEqual(l.output_ratio, 1)
+    self.assertTrue(l.supports_step)
+
+    source = random_sequence(batch_size, source_time, source_channels)
+    constants = {source_name: source}
+
+    self.assertEqual(
+        l.get_output_shape((channels,), constants=constants),
+        (num_heads, source_channels),
+    )
+
+    # Verify kernel shapes.
+    self.assertEqual(
+        l._mlp_hidden.kernel.shape,
+        (channels, num_heads, units_per_head),
+    )
+    self.assertEqual(
+        l._mlp_output.kernel.shape,
+        (num_heads, units_per_head, num_components, 3),
+    )
+    self.assertEqual(
+        l._mlp_output.bias.shape,
+        (num_heads, num_components, 3),
+    )
+
+    for time in [11, 12]:
+      with self.subTest(f'time{time}'):
+        x = random_sequence(batch_size, time, channels)
+        self.verify_contract(
+            l, x, constants=constants,
+            grad_atol=1e-5, grad_rtol=1e-5,
+        )
+
+  def test_non_monotonic(self):
+    l = attention.GmmAttention(
+        source_name='source',
+        num_heads=2,
+        units_per_head=4,
+        num_components=3,
+        monotonic=False,
+        in_features=5,
+        rngs=nnx.Rngs(0),
+    )
+
+    source = random_sequence(2, 8, 3)
+    constants = {'source': source}
+    x = random_sequence(2, 6, 5)
+    self.verify_contract(
+        l, x, constants=constants,
+        grad_atol=1e-5, grad_rtol=1e-5,
+    )
+
+  def test_max_offset(self):
+    l = attention.GmmAttention(
+        source_name='source',
+        num_heads=2,
+        units_per_head=4,
+        num_components=3,
+        monotonic=True,
+        in_features=5,
+        max_offset=5.0,
+        rngs=nnx.Rngs(0),
+    )
+
+    source = random_sequence(2, 8, 3)
+    constants = {'source': source}
+    x = random_sequence(2, 5, 5)
+    self.verify_contract(
+        l, x, constants=constants,
+        grad_atol=1e-5, grad_rtol=1e-5,
+    )
+
+  def test_no_output_bias(self):
+    l = attention.GmmAttention(
+        source_name='source',
+        num_heads=2,
+        units_per_head=4,
+        num_components=3,
+        monotonic=False,
+        in_features=5,
+        output_use_bias=False,
+        rngs=nnx.Rngs(0),
+    )
+
+    source = random_sequence(2, 8, 3)
+    constants = {'source': source}
+    x = random_sequence(2, 6, 5)
+    self.verify_contract(
+        l, x, constants=constants,
+        grad_atol=1e-5, grad_rtol=1e-5,
+    )
+
+  def test_emits(self):
+    num_heads = 3
+    source_time = 11
+    source_channels = 2
+    source_name = 'source'
+
+    l = attention.GmmAttention(
+        source_name=source_name,
+        num_heads=num_heads,
+        units_per_head=5,
+        num_components=5,
+        monotonic=True,
+        in_features=3,
+        init_offset_bias=1.0,
+        init_scale_bias=1.0,
+        rngs=nnx.Rngs(0),
+    )
+    l.eval()
+
+    batch_size = 2
+    source = random_sequence(batch_size, source_time, source_channels)
+    constants = {source_name: source}
+
+    time, channels = 7, 3
+    x = random_sequence(batch_size, time, channels)
+
+    _, emits = l.layer_with_emits(x, constants=constants)
+    self.assertIsInstance(emits, attention.CrossAttentionEmits)
+    self.assertEqual(
+        emits.probabilities.values.shape,
+        (batch_size, time, num_heads, source_time),
+    )
+
+    # Test step_with_emits with 3 timesteps.
+    x3 = x[:, :3]
+    state = l.get_initial_state(
+        batch_size=batch_size,
+        input_spec=x3.channel_spec,
+        constants=constants,
+    )
+    _, _, step_emits = l.step_with_emits(
+        x3, state, constants=constants
+    )
+    self.assertIsInstance(step_emits, attention.CrossAttentionEmits)
+    self.assertEqual(
+        step_emits.probabilities.values.shape,
+        (batch_size, 3, num_heads, source_time),
+    )
+
+  def test_missing_source_raises(self):
+    l = attention.GmmAttention(
+        source_name='source',
+        num_heads=2,
+        units_per_head=4,
+        num_components=3,
+        monotonic=False,
+        in_features=5,
+        rngs=nnx.Rngs(0),
+    )
+    l.eval()
+    x = random_sequence(2, 7, 5)
+    with self.assertRaises(ValueError):
+      l.layer(x)
+
+  def test_invalid_num_components(self):
+    with self.assertRaises(ValueError):
+      attention.GmmAttention(
+          source_name='source',
+          num_heads=2,
+          units_per_head=4,
+          num_components=0,
+          monotonic=False,
+          in_features=5,
+          rngs=nnx.Rngs(0),
+      )
+
+
 if __name__ == '__main__':
   test_utils.main()

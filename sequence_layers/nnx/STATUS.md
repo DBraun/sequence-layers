@@ -2,7 +2,7 @@
 
 Proof-of-concept port of `sequence_layers` from Flax Linen to Flax NNX.
 
-**280 tests passing** across all ported modules.
+**312 tests passing** across all ported modules.
 
 ## Ported
 
@@ -72,6 +72,7 @@ All base classes ported: `SequenceLayer`, `Steppable`, `Stateless`,
 |--------|--------|
 | DotProductSelfAttention | Done |
 | DotProductAttention (cross) | Done |
+| GmmAttention | Done |
 
 ### combinators.py
 | Ported | Status |
@@ -82,6 +83,13 @@ All base classes ported: `SequenceLayer`, `Steppable`, `Stateless`,
 | Bidirectional | Done |
 | Repeat | Done |
 | Blockwise | Done |
+
+### dsp.py
+| Ported | Status |
+|--------|--------|
+| Delay | Done |
+| Lookahead | Done |
+| Window | Done |
 
 ---
 
@@ -129,21 +137,18 @@ equivalents.
 | StreamingDotProductAttention | Streaming cross-attention with KV cache ring buffers |
 | StreamingLocalDotProductAttention | Combines streaming + local windowing |
 | BlockwiseDotProductSelfAttention | Flash attention + block-based segment masking |
-| GmmAttention | Gaussian mixture attention; uses `FlaxEinsumDense`, very complex |
 | MultiSourceDotProductAttention | Multi-source cross-attention with flash attention |
 | ShawRelativePositionEmbedding | Relative position embedding variant |
 | T5RelativePositionEmbedding | Relative position embedding variant |
 | TransformerXLRelativePositionEmbedding | Relative position embedding variant |
 
-### dsp.py (entire module)
+### dsp.py
 | Layer | Reason |
 |-------|--------|
 | Frame, OverlapAdd | Complex time-domain reshaping with custom step logic |
 | FFT, IFFT, RFFT, IRFFT | FFT wrappers; depend on Frame/OverlapAdd |
 | STFT, InverseSTFT | Depend on Frame, Window, FFT layers |
 | LinearToMelSpectrogram | Depends on STFT infrastructure |
-| Delay, Lookahead | Relatively simple; could be ported independently |
-| Window | Relatively simple; could be ported independently |
 
 ### conditioning.py (entire module)
 | Layer | Reason |
@@ -154,11 +159,13 @@ equivalents.
 
 ## Suggested Next Steps (by priority)
 
-1. **Delay, Lookahead, Window** (from dsp.py) — self-contained, no deep
-   Linen dependencies.
-2. **CheckpointGradient** — NNX has `nnx.remat`; should be a thin wrapper.
-3. **ParallelChannels** — medium complexity, useful combinator.
-4. **Advanced attention variants** — require porting
+1. **CheckpointGradient** — NNX has `nnx.remat`; should be a thin wrapper.
+2. **ParallelChannels** — medium complexity, useful combinator.
+3. **Frame, OverlapAdd** (from dsp.py) — complex but self-contained;
+   unlocks FFT/STFT layers.
+4. **Relative position embeddings** (Shaw, T5, TransformerXL) — easy to
+   moderate; prerequisite for LocalDotProductSelfAttention.
+5. **Advanced attention variants** — require porting
    `AttentionInputProjectionHelper` and attention common utilities first.
-   `EinsumDense` is now available to support this.
-   This is a large effort that unlocks all 7+ attention variants.
+   `EinsumDense` and `GmmAttention` are now available.
+   This is a large effort that unlocks all 6+ remaining attention variants.

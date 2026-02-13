@@ -136,7 +136,13 @@ from sequence_layers.nnx.position import ApplyRotaryPositionalEncoding
 from sequence_layers.nnx.attention import CrossAttentionEmits
 from sequence_layers.nnx.attention import DotProductAttention
 from sequence_layers.nnx.attention import DotProductSelfAttention
+from sequence_layers.nnx.attention import GmmAttention
 from sequence_layers.nnx.attention import SelfAttentionEmits
+
+# DSP layers.
+from sequence_layers.nnx.dsp import Delay
+from sequence_layers.nnx.dsp import Lookahead
+from sequence_layers.nnx.dsp import Window
 
 # Combinators.
 from sequence_layers.nnx.combinators import Bidirectional
