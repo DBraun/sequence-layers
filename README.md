@@ -16,6 +16,8 @@ with our intro notebook:
 **Note:** Only Jax support is installed by default. Use
 `pip install sequence_layers[mlx]` for MLX and `pip install sequence_layers[tensorflow]` for TensorFlow.
 
+For MLX usage (inference on Apple Silicon), see the [MLX Backend Guide](docs/mlx_guide.md).
+
 **Disclaimer:** This is not an officially supported Google product.
 
 ## Streamable networks, out of the box

@@ -1,34 +1,67 @@
 """Basic sequence types for MLX."""
 
-from typing import Generic, TypeVar
+import enum
+from typing import Callable, Generic, Iterable, TypeVar
+
 import mlx.core as mx
 import numpy as np
 
-# A rank 2+ tensor of any type.
-# Note: MLX does not support jaxtyping-style shape annotations out of the box,
-# so we simply bind to mx.array.
-ValuesT = TypeVar('ValuesT', bound=mx.array)
 
-# You can also add the others if you need them:
+# Type aliases.
+MASK_DTYPE = mx.bool_
+
+ValuesT = TypeVar('ValuesT', bound=mx.array)
 MaskT = TypeVar('MaskT', bound=mx.array)
 LengthsT = TypeVar('LengthsT', bound=mx.array)
 ExpandedMaskT = TypeVar('ExpandedMaskT', bound=mx.array)
-# A "self" type alias to allow Sequence and subclasses to return their own
-# Sequence subtype.
 SequenceSelf = TypeVar('SequenceSelf', bound='Sequence')
+
 Shape = tuple[int, ...]
+ShapeLike = list[int] | tuple[int, ...]
 DType = np.dtype
+State = object  # Any pytree.
+Constants = dict[str, object]
+Emits = object
+
+# Receptive field.
+ReceptiveField = tuple[float | int, float | int] | None
+
+
+class ShapeDType:
+  """Lightweight replacement for jax.ShapeDtypeStruct."""
+
+  def __init__(self, shape: Shape, dtype: DType):
+    self.shape = shape
+    self.dtype = dtype
+
+  def __repr__(self) -> str:
+    return f'ShapeDType(shape={self.shape}, dtype={self.dtype})'
+
+  def __eq__(self, other: object) -> bool:
+    if not isinstance(other, ShapeDType):
+      return NotImplemented
+    return self.shape == other.shape and self.dtype == other.dtype
+
+  def __hash__(self) -> int:
+    return hash((self.shape, self.dtype))
+
+
+ChannelSpec = ShapeDType
+
+
+class PaddingMode(enum.Enum):
+  VALID = 'valid'
+  SAME = 'same'
+  CAUSAL_VALID = 'causal_valid'
+  REVERSE_CAUSAL_VALID = 'reverse_causal_valid'
+  CAUSAL = 'causal'
+  REVERSE_CAUSAL = 'reverse_causal'
+  SEMICAUSAL = 'semicausal'
+  SEMICAUSAL_FULL = 'semicausal_full'
 
 
 def sequence_mask(lengths: LengthsT, maxlen: int) -> MaskT:
   return mx.arange(maxlen)[None, :] < mx.array(lengths)[:, None]
-
-
-class ChannelSpec:
-  """A specification for the channel shape and dtype of a sequence."""
-
-  shape: Shape
-  dtype: DType
 
 
 class Sequence(Generic[ValuesT, MaskT]):
@@ -66,17 +99,131 @@ class Sequence(Generic[ValuesT, MaskT]):
     """Returns the dtype of the sequence values."""
     return self.values.dtype
 
+  @classmethod
+  def from_values(cls, values: ValuesT) -> 'MaskedSequence':
+    """Returns a MaskedSequence assuming every timestep is valid."""
+    if values.ndim < 2:
+      raise ValueError(f'Expected {values.ndim=} to be at least 2.')
+    return MaskedSequence(values, mx.ones(values.shape[:2], dtype=mx.bool_))
+
+  @classmethod
+  def concatenate_sequences(cls, sequences: Iterable['Sequence']) -> 'Sequence':
+    """Concatenates sequences and their masks on the time axis."""
+    values = []
+    masks = []
+    all_masked = True
+    for sequence in sequences:
+      if not isinstance(sequence, MaskedSequence):
+        all_masked = False
+      values.append(sequence.values)
+      masks.append(sequence.mask)
+    seq_type = MaskedSequence if all_masked else Sequence
+    return seq_type(
+        mx.concatenate(values, axis=1),
+        mx.concatenate(masks, axis=1),
+    )
+
   def expanded_mask(self) -> ExpandedMaskT:
-    """Returns the Sequence mask with dimensions expanded to match values."""
+    """Returns the Sequence mask expanded to match values rank."""
     return self.mask.reshape(self.mask.shape + (1,) * (self.values.ndim - 2))
 
+  def apply_values(
+      self,
+      values_fn: Callable[..., ValuesT],
+      *args,
+      **kwargs,
+  ) -> 'Sequence':
+    """Transforms values, assuming result is unmasked."""
+    return Sequence(values_fn(self.values, *args, **kwargs), self.mask)
+
+  def apply_values_masked(
+      self: SequenceSelf,
+      values_fn: Callable[..., ValuesT],
+      *args,
+      **kwargs,
+  ) -> SequenceSelf:
+    """Transforms values, preserving masked state."""
+    return type(self)(values_fn(self.values, *args, **kwargs), self.mask)
+
+  def apply(
+      self,
+      apply_fn: Callable[..., tuple[ValuesT, MaskT]],
+      *args,
+      **kwargs,
+  ) -> 'Sequence':
+    """Transforms values/mask, assuming result is unmasked."""
+    values, mask = apply_fn(self.values, self.mask, *args, **kwargs)
+    return Sequence(values, mask)
+
+  def apply_masked(
+      self: SequenceSelf,
+      apply_fn: Callable[..., tuple[ValuesT, MaskT]],
+      *args,
+      **kwargs,
+  ) -> SequenceSelf:
+    """Transforms values/mask, preserving masked state."""
+    values, mask = apply_fn(self.values, self.mask, *args, **kwargs)
+    return type(self)(values, mask)
+
+  def astype(self: SequenceSelf, dtype: DType | None) -> SequenceSelf:
+    """Returns a copy with values cast to dtype."""
+    if dtype is None:
+      return self
+    return type(self)(self.values.astype(dtype), self.mask)
+
+  def lengths(self) -> mx.array:
+    """Returns the number of valid timesteps per batch item."""
+    return mx.sum(self.mask.astype(mx.int32), axis=1)
+
+  def __getitem__(
+      self: SequenceSelf,
+      the_slice,
+  ) -> SequenceSelf:
+    """Slices the Sequence values and mask."""
+    if isinstance(the_slice, slice):
+      the_slice = (the_slice,)
+    return type(self)(
+        self.values.__getitem__(the_slice),
+        self.mask.__getitem__(the_slice[:2]),
+    )
+
+  def pad_time(
+      self: SequenceSelf,
+      pad_left: int,
+      pad_right: int,
+      valid: bool,
+      pad_value: float | None = None,
+  ) -> SequenceSelf:
+    """Pads this sequence with timesteps on the left and right."""
+    if not pad_left and not pad_right:
+      return self
+    pad_val = 0.0 if pad_value is None else pad_value
+    values_rank = self.values.ndim
+    values = mx.pad(
+        self.values,
+        [(0, 0), (pad_left, pad_right)] + [(0, 0)] * (values_rank - 2),
+        constant_values=pad_val,
+    )
+    mask = mx.pad(
+        self.mask,
+        [(0, 0), (pad_left, pad_right)],
+        constant_values=valid,
+    )
+    return type(self)(values, mask)
+
+  def concatenate(self, other: 'Sequence') -> 'Sequence':
+    """Concatenates with other on the time dimension."""
+    values = mx.concatenate([self.values, other.values], axis=1)
+    mask = mx.concatenate([self.mask, other.mask], axis=1)
+    return_type = type(self) if type(self) is type(other) else Sequence
+    return return_type(values, mask)
+
   def mask_invalid(self, mask_value: complex | None = None) -> 'Sequence':
-    """Returns a sequence with invalid timesteps replaced with mask_value."""
+    """Returns a sequence with invalid timesteps replaced."""
     raise NotImplementedError('Replaced below.')
 
   def unmask(self) -> 'Sequence':
-    """Returns an unmasked version of this sequence with unchanged values."""
-    # We are already an unmasked sequence.
+    """Returns an unmasked version with unchanged values."""
     return self
 
 
@@ -84,14 +231,11 @@ class MaskedSequence(Sequence[ValuesT, MaskT]):
   """Sequence whose invalid timesteps are masked to zero."""
 
   def mask_invalid(self, mask_value: complex | None = None) -> 'Sequence':
-    """Returns a sequence with invalid timesteps replaced with mask_value."""
     if mask_value is None:
       return self
-    else:
-      return mask_invalid(self, mask_value)
+    return mask_invalid(self, mask_value)
 
   def unmask(self) -> Sequence:
-    """Returns an unmasked version of this sequence with unchanged values."""
     return Sequence(self.values, self.mask)
 
 
@@ -99,7 +243,7 @@ def mask_invalid(
     sequence: Sequence,
     mask_value: complex | None = None,
 ) -> 'Sequence':
-  """Returns a sequence whose invalid timesteps are replaced with mask_value."""
+  """Returns a sequence with invalid timesteps replaced."""
   expanded_mask = sequence.expanded_mask()
   if mask_value is None:
     masked_values = mx.zeros_like(sequence.values)
@@ -113,5 +257,5 @@ def mask_invalid(
   return result_type(masked_values, sequence.mask)
 
 
-# Defined outside of Sequence so that mask_invalid can return a MaskedSequence.
+# Defined outside of Sequence so mask_invalid can return MaskedSequence.
 Sequence.mask_invalid = mask_invalid
