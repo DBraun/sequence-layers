@@ -1,5 +1,6 @@
 """Dot-product attention layers for MLX."""
 
+import dataclasses
 import math
 
 import mlx.core as mx
@@ -7,7 +8,9 @@ import numpy as np
 
 from sequence_layers.mlx import basic_types as bt
 from sequence_layers.mlx import init_mapping
+from sequence_layers.mlx import projection_configs
 from sequence_layers.mlx import types
+from sequence_layers.jax.types import SequenceLayerConfig as _SequenceLayerConfig
 
 Sequence = bt.Sequence
 MaskedSequence = bt.MaskedSequence
@@ -41,6 +44,40 @@ class DotProductSelfAttention(types.Emitting):
     v_proj: [in_features, num_kv_heads * units_per_head]
     out_proj: [num_heads * units_per_head, in_features]
   """
+
+  @dataclasses.dataclass(frozen=True)
+  class Config(_SequenceLayerConfig):
+    """MLX-native configuration for DotProductSelfAttention."""
+
+    num_heads: int
+    units_per_head: int
+    max_past_horizon: int
+    max_future_horizon: int = 0
+    num_kv_heads: int | None = None
+    attention_probabilities_dropout_rate: float = 0.0
+    broadcast_dropout_across_queries: bool = False
+    use_bias: bool = False
+    input_projection: projection_configs.QueryKeyValueProjectionConfig = (
+        dataclasses.field(
+            default_factory=projection_configs.CombinedQueryKeyValueProjection
+        )
+    )
+    query_network: _SequenceLayerConfig | None = None
+    key_network: _SequenceLayerConfig | None = None
+    value_network: _SequenceLayerConfig | None = None
+    attention_logits_soft_cap: float | None = None
+    per_dim_scale: bool = False
+    query_scale: float | None = None
+    zero_fully_masked: bool = False
+    compute_dtype: types.DType | None = None
+    param_dtype: types.DType = mx.float32
+    num_sink_embeddings: int = 0
+    use_sink_scalars: bool = False
+    use_kv_cache_ringbuffer: bool = False
+    name: str | None = None
+
+    def make(self) -> 'DotProductSelfAttention':
+      return DotProductSelfAttention.from_config(self)
 
   def __init__(
       self,
@@ -430,10 +467,10 @@ class DeferredDotProductSelfAttention(types.Emitting):
   def __init__(self, config):
     super().__init__()
     self._config = config
-    self._inner = None
+    self.inner = None
 
   def _ensure_initialized(self, in_features, backend='mlx'):
-    if self._inner is not None:
+    if self.inner is not None:
       return
 
     # Build optional Q/K/V networks.
@@ -451,7 +488,7 @@ class DeferredDotProductSelfAttention(types.Emitting):
     if compute_dtype is not None:
       compute_dtype = init_mapping._to_mx_dtype(compute_dtype)
     param_dtype = init_mapping._to_mx_dtype(self._config.param_dtype)
-    self._inner = DotProductSelfAttention(
+    self.inner = DotProductSelfAttention(
         in_features=in_features,
         num_heads=self._config.num_heads,
         units_per_head=self._config.units_per_head,
@@ -498,36 +535,54 @@ class DeferredDotProductSelfAttention(types.Emitting):
 
   def get_initial_state(self, batch_size, input_spec, *, constants=None):
     self._ensure_initialized(input_spec.shape[-1])
-    return self._inner.get_initial_state(
+    return self.inner.get_initial_state(
         batch_size, input_spec, constants=constants
     )
 
   def layer_with_emits(self, x, *, constants=None):
     self._ensure_initialized(x.shape[-1])
-    return self._inner.layer_with_emits(x, constants=constants)
+    return self.inner.layer_with_emits(x, constants=constants)
 
   def step_with_emits(self, x, state, *, constants=None):
     self._ensure_initialized(x.shape[-1])
-    return self._inner.step_with_emits(x, state, constants=constants)
+    return self.inner.step_with_emits(x, state, constants=constants)
 
 
 class DotProductAttention(types.Emitting):
-  """Multi-headed dot-product cross attention for MLX.
+  """Multi-headed dot-product cross attention for MLX."""
 
-  Queries come from the input sequence; keys and values come from a
-  source sequence looked up in the ``constants`` dictionary.
+  @dataclasses.dataclass(frozen=True)
+  class Config(_SequenceLayerConfig):
+    """MLX-native configuration for DotProductAttention."""
 
-  In ``layer()`` mode the K/V projections and optional networks are
-  applied to the source on-the-fly.  In ``step()`` mode they are
-  pre-computed during ``get_initial_state()`` so that each step only
-  needs to project and attend queries.
+    source_name: str
+    num_heads: int
+    units_per_head: int
+    attention_probabilities_dropout_rate: float = 0.0
+    broadcast_dropout_across_queries: bool = False
+    use_bias: bool = False
+    input_projection: (
+        projection_configs.QueryAndKeyValueProjection
+        | projection_configs.SeparateQueryKeyValueProjection
+        | projection_configs.QueryAndSharedKeyValueProjection
+    ) = dataclasses.field(
+        default_factory=projection_configs.QueryAndKeyValueProjection
+    )
+    query_network: _SequenceLayerConfig | None = None
+    key_network: _SequenceLayerConfig | None = None
+    value_network: _SequenceLayerConfig | None = None
+    attention_logits_soft_cap: float | None = None
+    per_dim_scale: bool = False
+    query_scale: float | None = None
+    zero_fully_masked: bool = False
+    compute_dtype: types.DType | None = None
+    param_dtype: types.DType = mx.float32
+    name: str | None = None
 
-  Kernels are stored in Linen-compatible shapes:
-    q_proj:   [in_features, num_heads * units_per_head]
-    k_proj:   [source_features, num_heads * units_per_head]
-    v_proj:   [source_features, num_heads * units_per_head]
-    out_proj: [num_heads * units_per_head, in_features]
-  """
+    def make(self) -> 'DotProductAttention':
+      return DotProductAttention.from_config(self)
+
+
 
   def __init__(
       self,
@@ -743,10 +798,10 @@ class DeferredDotProductAttention(types.Emitting):
   def __init__(self, config):
     super().__init__()
     self._config = config
-    self._inner = None
+    self.inner = None
 
   def _ensure_initialized(self, in_features, source_features, backend='mlx'):
-    if self._inner is not None:
+    if self.inner is not None:
       return
 
     query_network = None
@@ -764,7 +819,7 @@ class DeferredDotProductAttention(types.Emitting):
       compute_dtype = init_mapping._to_mx_dtype(compute_dtype)
     param_dtype = init_mapping._to_mx_dtype(self._config.param_dtype)
 
-    self._inner = DotProductAttention(
+    self.inner = DotProductAttention(
         in_features=in_features,
         source_features=source_features,
         source_name=self._config.source_name,
@@ -819,19 +874,19 @@ class DeferredDotProductAttention(types.Emitting):
   def get_initial_state(self, batch_size, input_spec, *, constants=None):
     source = self._get_source(constants)
     self._ensure_initialized(input_spec.shape[-1], source.shape[-1])
-    return self._inner.get_initial_state(
+    return self.inner.get_initial_state(
         batch_size, input_spec, constants=constants
     )
 
   def layer_with_emits(self, x, *, constants=None):
     source = self._get_source(constants)
     self._ensure_initialized(x.shape[-1], source.shape[-1])
-    return self._inner.layer_with_emits(x, constants=constants)
+    return self.inner.layer_with_emits(x, constants=constants)
 
   def step_with_emits(self, x, state, *, constants=None):
     source = self._get_source(constants)
     self._ensure_initialized(x.shape[-1], source.shape[-1])
-    return self._inner.step_with_emits(x, state, constants=constants)
+    return self.inner.step_with_emits(x, state, constants=constants)
 
 
 def _banded_mask(q_len, kv_len, num_lower, num_upper):
@@ -869,6 +924,8 @@ def _step_visibility_mask(
 class StreamingDotProductAttention(types.Emitting):
   """Multi-headed streaming cross-attention for MLX.
 
+  Also covers StreamingLocalDotProductAttention from the JAX backend.
+
   Queries come from the input; keys and values come from a source
   sequence provided in constants at the same streaming rate as input.
 
@@ -885,6 +942,48 @@ class StreamingDotProductAttention(types.Emitting):
     k_proj: [source_features, num_heads * units_per_head]
     v_proj: [source_features, num_heads * units_per_head]
   """
+
+  @dataclasses.dataclass(frozen=True)
+  class Config(_SequenceLayerConfig):
+    """MLX-native configuration for StreamingDotProductAttention.
+
+    This Config also serves as the MLX-native equivalent of the JAX
+    StreamingLocalDotProductAttention.Config.
+    """
+
+    source_name: str
+    num_heads: int
+    units_per_head: int
+    block_size: int = 1
+    max_past_horizon: int = 1
+    max_future_horizon: int = 0
+    attention_probabilities_dropout_rate: float = 0.0
+    broadcast_dropout_across_queries: bool = False
+    use_bias: bool = False
+    use_query_delay_buffer: bool = True
+    input_projection: (
+        projection_configs.QueryAndKeyValueProjection
+        | projection_configs.SeparateQueryKeyValueProjection
+        | projection_configs.QueryAndSharedKeyValueProjection
+    ) = dataclasses.field(
+        default_factory=projection_configs.QueryAndKeyValueProjection
+    )
+    query_network: _SequenceLayerConfig | None = None
+    key_network: _SequenceLayerConfig | None = None
+    value_network: _SequenceLayerConfig | None = None
+    attention_logits_soft_cap: float | None = None
+    per_dim_scale: bool = False
+    query_scale: float | None = None
+    zero_fully_masked: bool = False
+    compute_dtype: types.DType | None = None
+    param_dtype: types.DType = mx.float32
+    num_sink_embeddings: int = 0
+    use_sink_scalars: bool = False
+    use_kv_cache_ringbuffer: bool = False
+    name: str | None = None
+
+    def make(self) -> 'StreamingDotProductAttention':
+      return StreamingDotProductAttention.from_config(self)
 
   def __init__(
       self,
@@ -1258,10 +1357,10 @@ class DeferredStreamingDotProductAttention(types.Emitting):
   def __init__(self, config):
     super().__init__()
     self._config = config
-    self._inner = None
+    self.inner = None
 
   def _ensure_initialized(self, in_features, source_features, backend='mlx'):
-    if self._inner is not None:
+    if self.inner is not None:
       return
 
     query_network = None
@@ -1279,7 +1378,7 @@ class DeferredStreamingDotProductAttention(types.Emitting):
       compute_dtype = init_mapping._to_mx_dtype(compute_dtype)
     param_dtype = init_mapping._to_mx_dtype(self._config.param_dtype)
 
-    self._inner = StreamingDotProductAttention(
+    self.inner = StreamingDotProductAttention(
         in_features=in_features,
         source_features=source_features,
         source_name=self._config.source_name,
@@ -1340,29 +1439,57 @@ class DeferredStreamingDotProductAttention(types.Emitting):
   def get_initial_state(self, batch_size, input_spec, *, constants=None):
     source = self._get_source(constants)
     self._ensure_initialized(input_spec.shape[-1], source.shape[-1])
-    return self._inner.get_initial_state(
+    return self.inner.get_initial_state(
         batch_size, input_spec, constants=constants
     )
 
   def layer_with_emits(self, x, *, constants=None):
     source = self._get_source(constants)
     self._ensure_initialized(x.shape[-1], source.shape[-1])
-    return self._inner.layer_with_emits(x, constants=constants)
+    return self.inner.layer_with_emits(x, constants=constants)
 
   def step_with_emits(self, x, state, *, constants=None):
     source = self._get_source(constants)
     self._ensure_initialized(x.shape[-1], source.shape[-1])
-    return self._inner.step_with_emits(x, state, constants=constants)
+    return self.inner.step_with_emits(x, state, constants=constants)
 
 
 class LocalDotProductSelfAttention(DotProductSelfAttention):
-  """Local dot-product self attention with configurable block_size.
+  """Local dot-product self attention with configurable block_size."""
 
-  Extends DotProductSelfAttention with a configurable block_size for
-  step-mode processing. The sliding window behavior is already handled
-  by the base class's banded visibility mask via max_past_horizon and
-  max_future_horizon.
-  """
+  @dataclasses.dataclass(frozen=True)
+  class Config(_SequenceLayerConfig):
+    """MLX-native configuration for LocalDotProductSelfAttention."""
+
+    num_heads: int
+    units_per_head: int
+    block_size: int
+    max_past_horizon: int
+    max_future_horizon: int = 0
+    attention_probabilities_dropout_rate: float = 0.0
+    broadcast_dropout_across_queries: bool = False
+    use_bias: bool = False
+    input_projection: projection_configs.QueryKeyValueProjectionConfig = (
+        dataclasses.field(
+            default_factory=projection_configs.CombinedQueryKeyValueProjection
+        )
+    )
+    query_network: _SequenceLayerConfig | None = None
+    key_network: _SequenceLayerConfig | None = None
+    value_network: _SequenceLayerConfig | None = None
+    attention_logits_soft_cap: float | None = None
+    per_dim_scale: bool = False
+    query_scale: float | None = None
+    zero_fully_masked: bool = False
+    compute_dtype: types.DType | None = None
+    param_dtype: types.DType = mx.float32
+    num_sink_embeddings: int = 0
+    use_sink_scalars: bool = False
+    use_kv_cache_ringbuffer: bool = False
+    name: str | None = None
+
+    def make(self) -> 'LocalDotProductSelfAttention':
+      return LocalDotProductSelfAttention.from_config(self)
 
   def __init__(self, *, block_size_config: int = 1, **kwargs):
     super().__init__(**kwargs)
@@ -1386,10 +1513,10 @@ class DeferredLocalDotProductSelfAttention(types.Emitting):
   def __init__(self, config):
     super().__init__()
     self._config = config
-    self._inner = None
+    self.inner = None
 
   def _ensure_initialized(self, in_features, backend='mlx'):
-    if self._inner is not None:
+    if self.inner is not None:
       return
 
     query_network = None
@@ -1407,7 +1534,7 @@ class DeferredLocalDotProductSelfAttention(types.Emitting):
       compute_dtype = init_mapping._to_mx_dtype(compute_dtype)
     param_dtype = init_mapping._to_mx_dtype(self._config.param_dtype)
 
-    self._inner = LocalDotProductSelfAttention(
+    self.inner = LocalDotProductSelfAttention(
         in_features=in_features,
         num_heads=self._config.num_heads,
         units_per_head=self._config.units_per_head,
@@ -1461,14 +1588,14 @@ class DeferredLocalDotProductSelfAttention(types.Emitting):
 
   def get_initial_state(self, batch_size, input_spec, *, constants=None):
     self._ensure_initialized(input_spec.shape[-1])
-    return self._inner.get_initial_state(
+    return self.inner.get_initial_state(
         batch_size, input_spec, constants=constants
     )
 
   def layer_with_emits(self, x, *, constants=None):
     self._ensure_initialized(x.shape[-1])
-    return self._inner.layer_with_emits(x, constants=constants)
+    return self.inner.layer_with_emits(x, constants=constants)
 
   def step_with_emits(self, x, state, *, constants=None):
     self._ensure_initialized(x.shape[-1])
-    return self._inner.step_with_emits(x, state, constants=constants)
+    return self.inner.step_with_emits(x, state, constants=constants)

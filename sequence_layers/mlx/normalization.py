@@ -1,11 +1,14 @@
 """Normalization layers for MLX."""
 
+import dataclasses
+
 import mlx.core as mx
 import mlx.nn as nn
 
 from sequence_layers.mlx import basic_types as bt
 from sequence_layers.mlx import init_mapping
 from sequence_layers.mlx import types
+from sequence_layers.jax.types import SequenceLayerConfig as _SequenceLayerConfig
 
 Sequence = bt.Sequence
 
@@ -55,12 +58,23 @@ class L2Normalize(types.PreservesType, types.StatelessPointwise):
 
 
 class RMSNormalization(types.PreservesType, types.StatelessPointwise):
-  """RMS Normalization backed by mlx.nn.RMSNorm.
+  """RMS Normalization backed by mlx.nn.RMSNorm."""
 
-  For simple axis=-1 normalization with a learned scale, this delegates
-  to mlx.nn.RMSNorm (which uses the optimized mx.fast.rms_norm).
-  Falls back to manual computation for multi-axis or no-scale cases.
-  """
+  @dataclasses.dataclass(frozen=True)
+  class Config(_SequenceLayerConfig):
+    axis: int | tuple[int, ...] = -1
+    epsilon: float = 1e-6
+    use_scale: bool = True
+    scale_init: object = None
+    param_dtype: types.DType = mx.float32
+    name: str | None = None
+
+    def __post_init__(self):
+      if not isinstance(self.axis, int):
+        object.__setattr__(self, 'axis', tuple(self.axis))
+
+    def make(self) -> 'RMSNormalization':
+      return RMSNormalization.from_config(self)
 
   def __init__(
       self,
@@ -149,6 +163,25 @@ class LayerNormalization(types.PreservesType, types.StatelessPointwise):
   For simple axis=-1 normalization, delegates to mlx.nn.LayerNorm.
   Falls back to manual computation for multi-axis cases.
   """
+
+  @dataclasses.dataclass(frozen=True)
+  class Config(_SequenceLayerConfig):
+    axis: int | tuple[int, ...] = -1
+    epsilon: float = 1e-6
+    use_bias: bool = True
+    use_scale: bool = True
+    # Accepted for JAX compatibility but ignored: MLX always reduces in fp32.
+    reductions_in_at_least_fp32: bool = True
+    param_dtype: types.DType = mx.float32
+    name: str | None = None
+
+    def __post_init__(self):
+      if not isinstance(self.axis, int):
+        object.__setattr__(self, 'axis', tuple(self.axis))
+
+    def make(self) -> 'LayerNormalization':
+      return LayerNormalization.from_config(self)
+
 
   def __init__(
       self,
