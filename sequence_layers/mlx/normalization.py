@@ -119,7 +119,9 @@ class RMSNormalization(types.PreservesType, types.StatelessPointwise):
     self._ensure_initialized(x.values.shape)
 
     if self._use_builtin and self._rms_norm is not None:
-      return Sequence(self._rms_norm(x.values), x.mask)
+      # Cast back to input dtype to preserve bfloat16 compute.
+      result = self._rms_norm(x.values).astype(x.values.dtype)
+      return Sequence(result, x.mask)
 
     values = x.values
     axes = _normalize_axes(self._axis, values.shape)
@@ -232,7 +234,9 @@ class LayerNormalization(types.PreservesType, types.StatelessPointwise):
     self._ensure_initialized(x.values.shape)
 
     if self._use_builtin and self._layer_norm is not None:
-      return Sequence(self._layer_norm(x.values), x.mask)
+      # Cast back to input dtype to preserve bfloat16 compute.
+      result = self._layer_norm(x.values).astype(x.values.dtype)
+      return Sequence(result, x.mask)
 
     values = x.values
     axes = _normalize_axes(self._axis, values.shape)
