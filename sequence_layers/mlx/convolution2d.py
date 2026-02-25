@@ -510,7 +510,16 @@ class Conv2DTranspose(types.SequenceLayer):
   def get_output_dtype(self, input_dtype, *, constants=None):
     return self.compute_dtype or self._param_dtype
 
-  def _forward(self, values):
+  def _conv_raw(self, values, trim_time=True):
+    """Compute raw conv_transpose2d, optionally trimming time.
+
+    Args:
+      values: Input values.
+      trim_time: If True, trim time dimension (for layer mode).
+                 If False, skip time trim (for step mode overlap-add).
+    Returns:
+      Raw convolution output WITHOUT bias or activation.
+    """
     compute_dtype = self.compute_dtype or self._param_dtype
     values = values.astype(compute_dtype)
     # mx.conv_transpose2d: input [B, H, W, C_in], weight [C_out, kH, kW, C_in/groups]
@@ -522,22 +531,34 @@ class Conv2DTranspose(types.SequenceLayer):
         dilation=self.dilation_rate,
         groups=self.groups,
     )
-    if self.use_bias:
-      y = y + self.bias.astype(compute_dtype)
-    if self.activation is not None:
-      y = self.activation(y)
-    # Trim time and spatial.
-    tl, tr = self._time_trim()
-    if tl > 0:
-      y = y[:, tl:]
-    if tr > 0:
-      y = y[:, :-tr]
+    # Time trim (only in layer mode; step mode handles it via overlap-add).
+    if trim_time:
+      tl, tr = self._time_trim()
+      if tl > 0:
+        y = y[:, tl:]
+      if tr > 0:
+        y = y[:, :-tr]
+    # Spatial trim (always applied).
     sl_val, sr = self._spatial_trim()
     if sl_val > 0:
       y = y[:, :, sl_val:]
     if sr > 0:
       y = y[:, :, :-sr]
     return y
+
+  def _apply_bias_and_activation(self, y):
+    """Apply bias and activation to conv output."""
+    compute_dtype = self.compute_dtype or self._param_dtype
+    if self.use_bias:
+      y = y + self.bias.astype(compute_dtype)
+    if self.activation is not None:
+      y = self.activation(y)
+    return y
+
+  def _forward(self, values):
+    """Full forward: conv + trim + bias + activation (for layer mode)."""
+    y = self._conv_raw(values, trim_time=True)
+    return self._apply_bias_and_activation(y)
 
   @types.check_layer
   def layer(self, x, *, constants=None):
@@ -569,7 +590,9 @@ class Conv2DTranspose(types.SequenceLayer):
   @types.check_step
   def step(self, x, state, *, constants=None):
     x = x.mask_invalid()
-    raw = self._forward(x.values)
+    # Conv WITHOUT time trimming — keep full temporal output for overlap-add.
+    # Bias is also deferred until after overlap-add (matching JAX behavior).
+    raw = self._conv_raw(x.values, trim_time=False)
     input_time = x.shape[1]
     out_time = input_time * self.strides[0]
     mask = mx.repeat(x.mask, self.strides[0], axis=1)
@@ -580,21 +603,32 @@ class Conv2DTranspose(types.SequenceLayer):
         - self.strides[0],
     )
     if ola_buf:
-      # Overlap-add with buffer.
-      buf_values = state.values
-      raw_left = raw[:, :ola_buf]
-      raw_right = raw[:, ola_buf:]
-      out_values = mx.concatenate([buf_values + raw_left, raw_right], axis=1)
+      # Pad the state buffer to match the raw output length, then overlap-add.
+      # raw has shape (B, raw_time, ...) where raw_time >= out_time + ola_buf
+      buf_values = state.values  # (B, ola_buf, ...)
+      pad_len = raw.shape[1] - ola_buf
+      if pad_len > 0:
+        buf_values = mx.concatenate(
+            [buf_values, mx.zeros_like(raw[:, :pad_len])], axis=1
+        )
+      # Overlap-add: add state to raw output.
+      out_values = buf_values + raw
+      # Split: first out_time samples are output, rest is new buffer.
       out = out_values[:, :out_time]
       new_buf = out_values[:, out_time:]
       if new_buf.shape[1] < ola_buf:
         pad_width = ola_buf - new_buf.shape[1]
         new_buf = mx.pad(new_buf, [(0, 0), (0, pad_width)] + [(0, 0)] * (new_buf.ndim - 2))
+      elif new_buf.shape[1] > ola_buf:
+        new_buf = new_buf[:, :ola_buf]
       new_mask = mx.zeros((x.values.shape[0], ola_buf), dtype=bt.MASK_DTYPE)
       state = MaskedSequence(new_buf, new_mask)
     else:
-      out = raw
+      out = raw[:, :out_time]
       state = ()
+
+    # Apply bias and activation AFTER overlap-add (only once per sample).
+    out = self._apply_bias_and_activation(out)
 
     out_mask = mask[:, :out.shape[1]]
     return Sequence(out, out_mask), state
