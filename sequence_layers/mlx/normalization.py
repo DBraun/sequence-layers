@@ -193,6 +193,7 @@ class LayerNormalization(types.PreservesType, types.StatelessPointwise):
       use_bias: bool = True,
       use_scale: bool = True,
       param_dtype=mx.float32,
+      reductions_in_at_least_fp32: bool = True,
   ):
     super().__init__()
     self._axis = axis
@@ -200,6 +201,7 @@ class LayerNormalization(types.PreservesType, types.StatelessPointwise):
     self.use_bias = use_bias
     self.use_scale = use_scale
     self._param_dtype = param_dtype
+    self.reductions_in_at_least_fp32 = reductions_in_at_least_fp32
     self._layer_norm = None
     self._use_builtin = False
     self._manual_scale = None
@@ -234,8 +236,12 @@ class LayerNormalization(types.PreservesType, types.StatelessPointwise):
     self._ensure_initialized(x.values.shape)
 
     if self._use_builtin and self._layer_norm is not None:
+      x_values = x.values
+      original_dtype = x_values.dtype
+      if self.reductions_in_at_least_fp32:
+        x_values = x_values.astype(mx.float32)
       # Cast back to input dtype to preserve bfloat16 compute.
-      result = self._layer_norm(x.values).astype(x.values.dtype)
+      result = self._layer_norm(x_values).astype(original_dtype)
       return Sequence(result, x.mask)
 
     values = x.values
@@ -278,6 +284,7 @@ class LayerNormalization(types.PreservesType, types.StatelessPointwise):
         use_bias=config.use_bias,
         use_scale=config.use_scale,
         param_dtype=_to_mx_dtype(config.param_dtype),
+        reductions_in_at_least_fp32=config.reductions_in_at_least_fp32
     )
 
 
