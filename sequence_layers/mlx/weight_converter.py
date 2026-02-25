@@ -362,6 +362,11 @@ def _load_attention(mlx_attn, linen_params, config):
     if v_bias is not None:
       inner.v_bias = mx.array(v_bias.reshape(-1))
 
+  # per_dim_scale: learned [units_per_head] query scale.
+  per_dim_scale = linen_params.get('per_dim_scale')
+  if per_dim_scale is not None:
+    inner._per_dim_scale = mx.array(per_dim_scale)
+
   # Q/K/V processing networks have no trainable params
   # (RoPE is stateless with no learned weights).
 
@@ -456,6 +461,11 @@ def _load_streaming_attention(mlx_attn, linen_params, config):
       b = mx.array(shared_bias.reshape(-1))
       inner.k_bias = b
       inner.v_bias = b
+
+  # per_dim_scale: learned [units_per_head] query scale.
+  per_dim_scale = linen_params.get('per_dim_scale')
+  if per_dim_scale is not None:
+    inner._per_dim_scale = mx.array(per_dim_scale)
 
 
 def _load_rms_norm(mlx_norm, linen_params, config):

@@ -16,6 +16,33 @@ Sequence = bt.Sequence
 MaskedSequence = bt.MaskedSequence
 
 
+def _scale_queries(queries, per_dim_scale, query_scale, units_per_head):
+  """Scale queries, optionally with per-dimension learned scale.
+
+  Matches JAX backend's _scale_query in common.py.
+
+  Args:
+    queries: [b, num_heads, q_time, units_per_head].
+    per_dim_scale: [units_per_head] learned scale or None.
+    query_scale: float scale or None (defaults to 1/sqrt(uph)).
+    units_per_head: int.
+
+  Returns:
+    Scaled queries, same shape.
+  """
+  if query_scale is None:
+    query_scale = 1.0 / math.sqrt(units_per_head)
+  if per_dim_scale is not None:
+    # 1/softplus(0) = 1/ln(2). At init (zeros), effective scale = query_scale.
+    r_softplus_0 = 1.442695041
+    scale = r_softplus_0 * query_scale
+    softplus = mx.log1p(mx.exp(per_dim_scale.astype(queries.dtype)))
+    queries = queries * (scale * softplus)
+  else:
+    queries = queries * query_scale
+  return queries
+
+
 def _causal_mask(q_len, kv_len):
   """Build a [1, 1, q_len, kv_len] causal mask (True = attend)."""
   # Each query at position i can attend to keys at positions
@@ -90,6 +117,7 @@ class DotProductSelfAttention(types.Emitting):
       num_kv_heads: int | None = None,
       use_bias: bool = False,
       query_scale: float | None = None,
+      per_dim_scale: bool = False,
       compute_dtype=None,
       param_dtype=mx.float32,
       kernel_init=None,
@@ -124,6 +152,11 @@ class DotProductSelfAttention(types.Emitting):
     self.compute_dtype = compute_dtype
     self._param_dtype = param_dtype
     self._attention_logits_soft_cap = attention_logits_soft_cap
+    self._per_dim_scale = (
+        mx.zeros((units_per_head,), dtype=param_dtype)
+        if per_dim_scale
+        else None
+    )
 
     if kernel_init is None:
       kernel_init = init_mapping._make_variance_scaling_init(
@@ -195,8 +228,6 @@ class DotProductSelfAttention(types.Emitting):
     Returns:
       context: [b, q_t, num_heads, units_per_head]
     """
-    scale = self._query_scale or (1.0 / math.sqrt(self.units_per_head))
-
     # GQA: repeat K/V heads to match query heads.
     num_groups = self.num_heads // self.num_kv_heads
     if num_groups > 1:
@@ -210,7 +241,9 @@ class DotProductSelfAttention(types.Emitting):
     v = mx.transpose(values, (0, 2, 1, 3))  # [b, nh, kvt, h]
 
     # Scaled dot-product attention.
-    q = q * scale
+    q = _scale_queries(
+        q, self._per_dim_scale, self._query_scale, self.units_per_head
+    )
     logits = mx.matmul(q, mx.transpose(k, (0, 1, 3, 2)))
 
     # Optional soft cap on logits (e.g., Gemma 2 uses cap=50.0).
@@ -497,6 +530,7 @@ class DeferredDotProductSelfAttention(types.Emitting):
         num_kv_heads=self._config.num_kv_heads,
         use_bias=self._config.use_bias,
         query_scale=getattr(self._config, 'query_scale', None),
+        per_dim_scale=getattr(self._config, 'per_dim_scale', False),
         compute_dtype=compute_dtype,
         param_dtype=param_dtype,
         kernel_init=init_mapping.map_initializer(
@@ -594,6 +628,7 @@ class DotProductAttention(types.Emitting):
       units_per_head: int,
       use_bias: bool = False,
       query_scale: float | None = None,
+      per_dim_scale: bool = False,
       compute_dtype=None,
       param_dtype=mx.float32,
       kernel_init=None,
@@ -612,6 +647,11 @@ class DotProductAttention(types.Emitting):
     self._query_scale = query_scale
     self.compute_dtype = compute_dtype
     self._param_dtype = param_dtype
+    self._per_dim_scale = (
+        mx.zeros((units_per_head,), dtype=param_dtype)
+        if per_dim_scale
+        else None
+    )
 
     if kernel_init is None:
       kernel_init = init_mapping._make_variance_scaling_init(
@@ -675,13 +715,13 @@ class DotProductAttention(types.Emitting):
 
   def _compute_attention(self, queries, keys, values, mask):
     """Compute scaled dot-product attention (no causal mask)."""
-    scale = self._query_scale or (1.0 / math.sqrt(self.units_per_head))
-
     q = mx.transpose(queries, (0, 2, 1, 3))
     k = mx.transpose(keys, (0, 2, 1, 3))
     v = mx.transpose(values, (0, 2, 1, 3))
 
-    q = q * scale
+    q = _scale_queries(
+        q, self._per_dim_scale, self._query_scale, self.units_per_head
+    )
     logits = mx.matmul(q, mx.transpose(k, (0, 1, 3, 2)))
 
     if mask is not None:
@@ -827,6 +867,7 @@ class DeferredDotProductAttention(types.Emitting):
         units_per_head=self._config.units_per_head,
         use_bias=self._config.use_bias,
         query_scale=getattr(self._config, 'query_scale', None),
+        per_dim_scale=getattr(self._config, 'per_dim_scale', False),
         compute_dtype=compute_dtype,
         param_dtype=param_dtype,
         kernel_init=init_mapping.map_initializer(
@@ -998,6 +1039,7 @@ class StreamingDotProductAttention(types.Emitting):
       use_bias: bool = False,
       use_query_delay_buffer: bool = True,
       query_scale: float | None = None,
+      per_dim_scale: bool = False,
       compute_dtype=None,
       param_dtype=mx.float32,
       kernel_init=None,
@@ -1028,6 +1070,11 @@ class StreamingDotProductAttention(types.Emitting):
     self._query_scale = query_scale
     self.compute_dtype = compute_dtype
     self._param_dtype = param_dtype
+    self._per_dim_scale = (
+        mx.zeros((units_per_head,), dtype=param_dtype)
+        if per_dim_scale
+        else None
+    )
 
     if kernel_init is None:
       kernel_init = init_mapping._make_variance_scaling_init(
@@ -1095,11 +1142,12 @@ class StreamingDotProductAttention(types.Emitting):
 
   def _compute_attention(self, queries, keys, values, mask):
     """Compute scaled dot-product attention."""
-    scale = self._query_scale or (1.0 / math.sqrt(self.units_per_head))
     q = mx.transpose(queries, (0, 2, 1, 3))
     k = mx.transpose(keys, (0, 2, 1, 3))
     v = mx.transpose(values, (0, 2, 1, 3))
-    q = q * scale
+    q = _scale_queries(
+        q, self._per_dim_scale, self._query_scale, self.units_per_head
+    )
     logits = mx.matmul(q, mx.transpose(k, (0, 1, 3, 2)))
     if mask is not None:
       large_neg = mx.array(-1e9, dtype=logits.dtype)
@@ -1391,6 +1439,7 @@ class DeferredStreamingDotProductAttention(types.Emitting):
             self._config, 'use_query_delay_buffer', True
         ),
         query_scale=getattr(self._config, 'query_scale', None),
+        per_dim_scale=getattr(self._config, 'per_dim_scale', False),
         compute_dtype=compute_dtype,
         param_dtype=param_dtype,
         kernel_init=init_mapping.map_initializer(
@@ -1543,6 +1592,7 @@ class DeferredLocalDotProductSelfAttention(types.Emitting):
         use_bias=self._config.use_bias,
         block_size_config=self._config.block_size,
         query_scale=getattr(self._config, 'query_scale', None),
+        per_dim_scale=getattr(self._config, 'per_dim_scale', False),
         compute_dtype=compute_dtype,
         param_dtype=param_dtype,
         attention_logits_soft_cap=getattr(
