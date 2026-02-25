@@ -267,7 +267,7 @@ def _load_dense(mlx_dense, linen_params, config):
   """Load Dense: transpose kernel [in, out] → [out, in]."""
   # Handle DenseDeferred wrapper.
   inner = mlx_dense
-  if hasattr(inner, '_inner') and inner.inner is not None:
+  if hasattr(inner, 'inner') and inner.inner is not None:
     inner = inner.inner
 
   kernel = linen_params.get('kernel')
@@ -308,7 +308,7 @@ def _load_attention(mlx_attn, linen_params, config):
 
   # Handle Deferred wrapper.
   inner = mlx_attn
-  if hasattr(inner, '_inner') and inner.inner is not None:
+  if hasattr(inner, 'inner') and inner.inner is not None:
     inner = inner.inner
 
   input_projection = config.input_projection
@@ -391,7 +391,7 @@ def _load_streaming_attention(mlx_attn, linen_params, config):
 
   # Handle Deferred wrapper.
   inner = mlx_attn
-  if hasattr(inner, '_inner') and inner.inner is not None:
+  if hasattr(inner, 'inner') and inner.inner is not None:
     inner = inner.inner
 
   input_projection = config.input_projection
@@ -535,7 +535,7 @@ def _load_group_norm(mlx_gn, linen_params, config):
 def _load_conv1d(mlx_conv, linen_params, config):
   """Load Conv1D: kernel [k, in, out] → [out, k, in]."""
   inner = mlx_conv
-  if hasattr(inner, '_inner') and inner.inner is not None:
+  if hasattr(inner, 'inner') and inner.inner is not None:
     inner = inner.inner
 
   kernel = linen_params.get('kernel')
@@ -560,7 +560,7 @@ def _load_conv1d_transpose(mlx_conv, linen_params, config):
   conv_transpose1d which reverses the kernel direction.
   """
   inner = mlx_conv
-  if hasattr(inner, '_inner') and inner.inner is not None:
+  if hasattr(inner, 'inner') and inner.inner is not None:
     inner = inner.inner
 
   kernel = linen_params.get('kernel')
