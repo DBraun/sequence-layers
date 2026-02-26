@@ -54,7 +54,7 @@ def check_layer(layer_fn):
   """Validates layer inputs and outputs."""
 
   @functools.wraps(layer_fn)
-  def wrapper(self, x, *, constants=None):
+  def wrapper(self, x, *, constants=None, **kwargs):
     y = layer_fn(self, x, constants=constants)
     _check_output_spec(self, x, y, constants)
     return y
@@ -66,7 +66,7 @@ def check_step(step_fn):
   """Validates step inputs and outputs."""
 
   @functools.wraps(step_fn)
-  def wrapper(self, x, state, *, constants=None):
+  def wrapper(self, x, state, *, constants=None, **kwargs):
     if not self.supports_step:
       raise ValueError(f'{self.__class__.__name__} does not support step().')
     block_size = self.block_size
@@ -118,7 +118,7 @@ class Steppable(metaclass=abc.ABCMeta):
     """Process this layer layer-wise."""
 
   def layer_with_emits(
-      self, x: Sequence, *, constants: Constants | None = None
+      self, x: Sequence, *, constants: Constants | None = None, **kwargs
   ) -> tuple[Sequence, Emits]:
     return self.layer(x, constants=constants), ()
 
@@ -138,6 +138,7 @@ class Steppable(metaclass=abc.ABCMeta):
       state: State,
       *,
       constants: Constants | None = None,
+      **kwargs,
   ) -> tuple[Sequence, State, Emits]:
     y, state = self.step(x, state, constants=constants)
     return y, state, ()
@@ -232,6 +233,7 @@ class Stateless(SequenceLayer):
       input_spec: ChannelSpec,
       *,
       constants: Constants | None = None,
+      **kwargs,
   ) -> State:
     return ()
 
@@ -241,6 +243,7 @@ class Stateless(SequenceLayer):
       state: State,
       *,
       constants: Constants | None = None,
+      **kwargs,
   ) -> tuple[Sequence, State]:
     return self.layer(x, constants=constants), state
 
@@ -288,6 +291,7 @@ class Emitting(SequenceLayer, metaclass=abc.ABCMeta):
       state: State,
       *,
       constants: Constants | None = None,
+      **kwargs,
   ) -> tuple[Sequence, State]:
     y, state, _ = self.step_with_emits(x, state, constants=constants)
     return y, state
@@ -303,7 +307,7 @@ class Emitting(SequenceLayer, metaclass=abc.ABCMeta):
     pass
 
   def layer(
-      self, x: Sequence, *, constants: Constants | None = None
+      self, x: Sequence, *, constants: Constants | None = None, **kwargs
   ) -> Sequence:
     y, _ = self.layer_with_emits(x, constants=constants)
     return y
@@ -324,6 +328,7 @@ class StatelessEmitting(Emitting):
       state: State,
       *,
       constants: Constants | None = None,
+      **kwargs,
   ) -> tuple[Sequence, State, Emits]:
     y, emits = self.layer_with_emits(x, constants=constants)
     return y, state, emits
@@ -334,5 +339,6 @@ class StatelessEmitting(Emitting):
       input_spec: ChannelSpec,
       *,
       constants: Constants | None = None,
+      **kwargs,
   ) -> State:
     return ()
