@@ -3,6 +3,7 @@
 import abc
 import fractions
 import functools
+import math
 from typing import Callable
 
 import mlx.nn as nn
@@ -110,6 +111,10 @@ class Steppable(metaclass=abc.ABCMeta):
   @property
   def output_latency(self) -> int:
     return int(self.input_latency * self.output_ratio)
+
+  def get_accumulated_input_latency(self, input_latency: int) -> int:
+    """Returns the accumulated input latency of this layer."""
+    return math.ceil(input_latency / self.output_ratio) + self.input_latency
 
   @abc.abstractmethod
   def layer(
