@@ -1,10 +1,8 @@
 """Tests for Dense MLX sequence layer."""
 
 import mlx.core as mx
-import numpy as np
 from absl.testing import absltest
 from absl.testing import parameterized
-from sequence_layers.mlx import basic_types as bt
 from sequence_layers.mlx import dense
 from sequence_layers.mlx import test_utils
 

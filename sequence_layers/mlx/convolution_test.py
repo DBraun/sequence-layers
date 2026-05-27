@@ -1,7 +1,5 @@
 """Tests for convolution MLX sequence layers."""
 
-import mlx.core as mx
-import numpy as np
 from absl.testing import absltest
 from absl.testing import parameterized
 from sequence_layers.mlx import convolution

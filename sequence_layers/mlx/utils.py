@@ -1,9 +1,5 @@
 """Utility functions for MLX sequence layers."""
 
-import fractions
-
-from sequence_layers.mlx.combinators import CombinationMode
-
 
 def get_output_latency(config, accumulated_output_latency=0):
   """Returns the output latency of the provided SequenceLayerConfig.

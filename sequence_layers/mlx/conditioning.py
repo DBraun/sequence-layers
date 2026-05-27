@@ -2,14 +2,10 @@
 
 import dataclasses
 import enum
-import math
 
 import mlx.core as mx
-import mlx.nn as nn
-import numpy as np
 
 from sequence_layers.mlx import basic_types as bt
-from sequence_layers.mlx import init_mapping
 from sequence_layers.mlx.init_mapping import _to_mx_dtype
 from sequence_layers.mlx import types
 from sequence_layers.jax.types import SequenceLayerConfig as _SequenceLayerConfig
