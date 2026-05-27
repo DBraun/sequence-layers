@@ -3,7 +3,6 @@
 import dataclasses
 
 import mlx.core as mx
-import numpy as np
 
 from sequence_layers.mlx import basic_types as bt
 from sequence_layers.mlx import types

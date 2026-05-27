@@ -1,13 +1,11 @@
 """Dense sequence layer for MLX."""
 
 import dataclasses
-import math
 
 from typing import Callable
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from sequence_layers.mlx import basic_types as bt
 from sequence_layers.mlx import init_mapping

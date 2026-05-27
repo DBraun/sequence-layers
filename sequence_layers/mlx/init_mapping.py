@@ -1,6 +1,5 @@
 """Mapping JAX/Flax initializers and activations to MLX equivalents."""
 
-import functools
 import math
 
 import jax
@@ -8,7 +7,6 @@ import jax.numpy as jnp
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from flax.linen import initializers as flax_init
 
 
 def _variance_scaling(key, shape, dtype, mode, distribution, fan_in, fan_out):

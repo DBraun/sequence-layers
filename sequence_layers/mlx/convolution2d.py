@@ -2,10 +2,8 @@
 
 import dataclasses
 import fractions
-import math
 
 import mlx.core as mx
-import mlx.nn as nn
 
 from sequence_layers.mlx import basic_types as bt
 from sequence_layers.mlx import convolution as conv_utils
