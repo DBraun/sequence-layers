@@ -171,7 +171,42 @@ def _load_config(mlx_module, linen_params, config, batch_stats=None):
     _load_conditioning(mlx_module, linen_params, config)
   elif isinstance(config, jax_simple.Embedding.Config):
     _load_embedding(mlx_module, linen_params, config)
+  elif type(config) in _CUSTOM_CONFIG_LOADERS:
+    # Allow downstream packages (e.g. magenta_rt) to register loaders
+    # for their own Config types. See register_config_loader.
+    _CUSTOM_CONFIG_LOADERS[type(config)](
+        mlx_module, linen_params, config, batch_stats
+    )
   # Stateless layers (Flatten, Identity, RoPE, pooling, etc.) have no params.
+
+
+# ---------------------------------------------------------------------------
+# Extension point for custom (non-sl) Config types
+# ---------------------------------------------------------------------------
+#
+# Downstream packages can register a loader function for their own Configs
+# so that load_linen_params() recurses into them correctly:
+#
+#     from sequence_layers.mlx import weight_converter
+#     def _load_my_layer(mlx_module, linen_params, config, batch_stats=None):
+#         ...
+#     weight_converter.register_config_loader(
+#         my_pkg.MyLayer.Config, _load_my_layer)
+#
+# The loader is called with the same signature as the built-in _load_* fns.
+_CUSTOM_CONFIG_LOADERS: dict = {}
+
+
+def register_config_loader(config_cls, loader_fn):
+  """Register a loader function for a custom (non-sl) Config type.
+
+  Args:
+    config_cls: The Config dataclass type.
+    loader_fn: Callable with signature
+      `(mlx_module, linen_params, config, batch_stats=None) -> None`
+      that copies linen_params into mlx_module in-place.
+  """
+  _CUSTOM_CONFIG_LOADERS[config_cls] = loader_fn
 
 
 def _load_serial(mlx_serial, linen_params, config, batch_stats=None):
