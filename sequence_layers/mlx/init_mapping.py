@@ -78,10 +78,13 @@ def _to_mx_dtype(dtype):
   if isinstance(dtype, mx.Dtype):
     return dtype
   name = getattr(dtype, '__name__', '') or str(dtype)
+  # Order matters for substring matching: longer / more-specific keys must
+  # come first so e.g. 'bfloat16' matches before 'float16' (which is a
+  # substring of 'bfloat16').
   mapping = {
+      'bfloat16': mx.bfloat16,
       'float32': mx.float32,
       'float16': mx.float16,
-      'bfloat16': mx.bfloat16,
       'float64': mx.float32,  # MLX lacks float64.
       'int32': mx.int32,
       'int64': mx.int32,  # MLX lacks int64.
@@ -89,8 +92,8 @@ def _to_mx_dtype(dtype):
       'int8': mx.int8,
       'uint8': mx.uint8,
       'uint32': mx.uint32,
-      'bool': mx.bool_,
       'bool_': mx.bool_,
+      'bool': mx.bool_,
       'complex64': mx.complex64,
   }
   for key, val in mapping.items():
